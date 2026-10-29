@@ -1,0 +1,848 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.auron.flink.connector.kafka;
+
+import static org.apache.auron.flink.connector.kafka.KafkaConstants.*;
+
+import java.io.File;
+import java.io.InputStream;
+import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import org.apache.auron.flink.arrow.FlinkArrowReader;
+import org.apache.auron.flink.arrow.FlinkArrowUtils;
+import org.apache.auron.flink.configuration.FlinkAuronConfiguration;
+import org.apache.auron.flink.runtime.operator.AuronPlanTreeRewriter;
+import org.apache.auron.flink.runtime.operator.FlinkAuronFunction;
+import org.apache.auron.flink.table.data.AuronColumnarRowData;
+import org.apache.auron.flink.utils.SchemaConverters;
+import org.apache.auron.jni.AuronAdaptor;
+import org.apache.auron.jni.AuronCallNativeWrapper;
+import org.apache.auron.jni.JniBridge;
+import org.apache.auron.metric.MetricNode;
+import org.apache.auron.protobuf.ArrowType;
+import org.apache.auron.protobuf.KafkaFormat;
+import org.apache.auron.protobuf.KafkaScanExecNode;
+import org.apache.auron.protobuf.KafkaStartupMode;
+import org.apache.auron.protobuf.PhysicalColumn;
+import org.apache.auron.protobuf.PhysicalExprNode;
+import org.apache.auron.protobuf.PhysicalPlanNode;
+import org.apache.auron.protobuf.ProjectionExecNode;
+import org.apache.commons.collections.map.LinkedMap;
+import org.apache.commons.io.FileUtils;
+import org.apache.flink.annotation.VisibleForTesting;
+import org.apache.flink.api.common.eventtime.WatermarkOutput;
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.state.CheckpointListener;
+import org.apache.flink.api.common.state.ListState;
+import org.apache.flink.api.common.state.ListStateDescriptor;
+import org.apache.flink.api.common.state.OperatorStateStore;
+import org.apache.flink.api.common.typeinfo.TypeHint;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.metrics.Counter;
+import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.runtime.state.FunctionInitializationContext;
+import org.apache.flink.runtime.state.FunctionSnapshotContext;
+import org.apache.flink.shaded.curator5.com.google.common.base.Preconditions;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
+import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
+import org.apache.flink.streaming.api.operators.StreamingRuntimeContext;
+import org.apache.flink.streaming.api.watermark.Watermark;
+import org.apache.flink.streaming.connectors.kafka.internals.KafkaTopicPartition;
+import org.apache.flink.streaming.connectors.kafka.internals.KafkaTopicPartitionAssigner;
+import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.types.logical.RowType;
+import org.apache.flink.util.SerializableObject;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.common.PartitionInfo;
+import org.apache.kafka.common.serialization.ByteArrayDeserializer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Auron Kafka source function.
+ * Only support AT-LEAST ONCE semantics.
+ * If checkpoints are enabled, Kafka offsets are committed via Auron after a successful checkpoint.
+ * If checkpoints are disabled, Kafka offsets are committed periodically via Auron.
+ *
+ * <p>Watermark support uses per-partition {@code WatermarkGenerator<RowData>} instances
+ * (from {@code WatermarkPushDownSpec}). Each Kafka partition gets an independent generator
+ * with a capture-only {@code WatermarkOutput}. The final watermark emitted to downstream is
+ * {@code min(non-idle partition watermarks)}, preventing a fast partition from pushing the
+ * watermark past a slow partition's progress. Supports both {@code DefaultWatermarkGenerator}
+ * and {@code WatermarksWithIdleness} (when {@code table.exec.source.idle-timeout} is set).
+ */
+public class AuronKafkaSourceFunction extends RichParallelSourceFunction<RowData>
+        implements FlinkAuronFunction, CheckpointListener, CheckpointedFunction {
+    private static final Logger LOG = LoggerFactory.getLogger(AuronKafkaSourceFunction.class);
+    private final LogicalType outputType;
+    private final String auronOperatorId;
+    private final String topic;
+    private final Properties kafkaProperties;
+    private final String format;
+    private final Map<String, String> formatConfig;
+    private final int bufferSize;
+    private final String startupMode;
+    private final long partitionDiscoveryIntervalMs;
+    private String mockData;
+    private transient PhysicalPlanNode physicalPlanNode;
+
+    // Merged Calc sub-plan handed down by a downstream Calc. When set, open() fuses the
+    // KafkaScan into this logical Project[Filter?[FFIReader-placeholder]] tree and runs the
+    // fused plan; the projected output schema replaces the original outputType downstream.
+    // Set at plan time, so these must survive operator serialization to the TaskManager
+    // (non-transient, like watermarkStrategy below).
+    private PhysicalPlanNode mergedCalcPlan;
+    private RowType mergedProjectedOutputType;
+
+    // Flink Checkpoint-related, compatible with Flink Kafka Legacy source
+    /** State name of the consumer's partition offset states. */
+    private static final String OFFSETS_STATE_NAME = "topic-partition-offset-states";
+
+    private transient ListState<Tuple2<KafkaTopicPartition, Long>> unionOffsetStates;
+    /** Data for pending but uncommitted offsets. */
+    private transient LinkedMap pendingOffsetsToCommit;
+
+    private transient Map<Integer, Long> restoredOffsets;
+    private transient Map<Integer, Long> currentOffsets;
+    private final SerializableObject lock = new SerializableObject();
+    private volatile boolean isRunning;
+    private transient String auronOperatorIdWithSubtaskIndex;
+    private transient MetricNode nativeMetric;
+    private transient MetricGroup metricGroup;
+    private transient ObjectMapper mapper;
+
+    // Kafka Consumer for partition metadata discovery only (does NOT consume data)
+    private transient KafkaConsumer<byte[], byte[]> kafkaConsumer;
+    private transient List<Integer> assignedPartitions;
+
+    // Partition discovery related
+    private transient ScheduledExecutorService partitionDiscoveryScheduler;
+    private transient volatile int knownPartitionCount;
+
+    // Watermark related: per-partition WatermarkGenerator with alignment
+    private WatermarkStrategy<RowData> watermarkStrategy;
+    private transient Map<Integer, PartitionWatermarkTracker> partitionWatermarkTrackers;
+    private transient long combinedWatermark;
+    private transient boolean allPartitionsIdle;
+
+    public AuronKafkaSourceFunction(
+            LogicalType outputType,
+            String auronOperatorId,
+            String topic,
+            Properties kafkaProperties,
+            String format,
+            Map<String, String> formatConfig,
+            int bufferSize,
+            String startupMode,
+            long partitionDiscoveryIntervalMs) {
+        this.outputType = outputType;
+        this.auronOperatorId = auronOperatorId;
+        this.topic = topic;
+        this.kafkaProperties = kafkaProperties;
+        this.format = format;
+        this.formatConfig = formatConfig;
+        this.bufferSize = bufferSize;
+        this.startupMode = startupMode;
+        this.partitionDiscoveryIntervalMs = partitionDiscoveryIntervalMs;
+    }
+
+    @Override
+    public void open(Configuration config) throws Exception {
+        // init auron plan
+        mapper = new ObjectMapper();
+        PhysicalPlanNode.Builder sourcePlan = PhysicalPlanNode.newBuilder();
+        KafkaScanExecNode.Builder scanExecNode = KafkaScanExecNode.newBuilder();
+        scanExecNode.setKafkaTopic(this.topic);
+        scanExecNode.setKafkaPropertiesJson(mapper.writeValueAsString(kafkaProperties));
+        scanExecNode.setDataFormat(KafkaFormat.valueOf(this.format.toUpperCase(Locale.ROOT)));
+        scanExecNode.setFormatConfigJson(mapper.writeValueAsString(formatConfig));
+        scanExecNode.setBatchSize(this.bufferSize);
+        if (this.format.equalsIgnoreCase(KafkaConstants.KAFKA_FORMAT_PROTOBUF)) {
+            // copy pb desc file
+            ClassLoader userClassloader = Thread.currentThread().getContextClassLoader();
+            String pbDescFileName = formatConfig.get(KafkaConstants.KAFKA_PB_FORMAT_PB_DESC_FILE_FIELD);
+            InputStream in = userClassloader.getResourceAsStream(pbDescFileName);
+            String pwd = System.getenv("PWD");
+            if (new File(pwd).exists()) {
+                File descFile = new File(pwd + "/" + pbDescFileName);
+                if (!descFile.exists()) {
+                    LOG.info("Auron kafka source writer pb desc file: {}", pbDescFileName);
+                    FileUtils.copyInputStreamToFile(in, descFile);
+                } else {
+                    LOG.warn("Auron kafka source pb desc file already exist, skip copy {}", pbDescFileName);
+                }
+            } else {
+                throw new RuntimeException("PWD is not exist");
+            }
+        }
+        // add kafka meta fields
+        scanExecNode.setSchema(SchemaConverters.convertToAuronSchema((RowType) outputType, true));
+        auronOperatorIdWithSubtaskIndex =
+                this.auronOperatorId + "-" + getRuntimeContext().getIndexOfThisSubtask();
+        scanExecNode.setAuronOperatorId(auronOperatorIdWithSubtaskIndex);
+        scanExecNode.setStartupMode(KafkaStartupMode.valueOf(startupMode));
+        StreamingRuntimeContext runtimeContext = (StreamingRuntimeContext) getRuntimeContext();
+        this.assignedPartitions = new ArrayList<>();
+        currentOffsets = new HashMap<>();
+        pendingOffsetsToCommit = new LinkedMap();
+        if (mockData != null) {
+            scanExecNode.setMockDataJsonArray(mockData);
+            JsonNode mockDataJson = mapper.readTree(mockData);
+            for (JsonNode data : mockDataJson) {
+                int partition = data.get("serialized_kafka_records_partition").asInt();
+                if (!assignedPartitions.contains(partition)) {
+                    assignedPartitions.add(partition);
+                }
+            }
+            LOG.info("Use mock data for auron kafka source, partition size = {}", assignedPartitions);
+        } else {
+            // 1. Initialize Kafka Consumer for partition metadata discovery only (not for data consumption)
+            Properties kafkaProps = new Properties();
+            kafkaProps.putAll(kafkaProperties);
+            // Override to ensure this consumer does not interfere with actual data consumption
+            kafkaProps.put(ConsumerConfig.GROUP_ID_CONFIG, "flink-auron-fetch-meta");
+            kafkaProps.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
+            kafkaProps.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class);
+            kafkaProps.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class);
+
+            this.kafkaConsumer = new KafkaConsumer<>(kafkaProps);
+
+            // 2. Discover and assign partitions for this subtask
+            List<PartitionInfo> partitionInfos = kafkaConsumer.partitionsFor(topic);
+            int subtaskIndex = runtimeContext.getIndexOfThisSubtask();
+            int numSubtasks = runtimeContext.getNumberOfParallelSubtasks();
+            for (PartitionInfo partitionInfo : partitionInfos) {
+                int partitionId = partitionInfo.partition();
+                if (KafkaTopicPartitionAssigner.assign(topic, partitionId, numSubtasks) == subtaskIndex) {
+                    assignedPartitions.add(partitionId);
+                }
+            }
+            boolean enableCheckpoint = runtimeContext.isCheckpointingEnabled();
+            Map<String, Object> auronRuntimeInfo = new HashMap<>();
+            auronRuntimeInfo.put("subtask_index", subtaskIndex);
+            auronRuntimeInfo.put("num_readers", numSubtasks);
+            auronRuntimeInfo.put("enable_checkpoint", enableCheckpoint);
+            auronRuntimeInfo.put("restored_offsets", restoredOffsets);
+            auronRuntimeInfo.put("assigned_partitions", assignedPartitions);
+            auronRuntimeInfo.put("partition_discovery_interval_ms", partitionDiscoveryIntervalMs);
+            JniBridge.putResource(auronOperatorIdWithSubtaskIndex, mapper.writeValueAsString(auronRuntimeInfo));
+            LOG.info(
+                    "Auron kafka source init successful, Auron operator id: {}, enableCheckpoint is {}, "
+                            + "subtask {} assigned partitions: {}",
+                    auronOperatorIdWithSubtaskIndex,
+                    enableCheckpoint,
+                    subtaskIndex,
+                    assignedPartitions);
+
+            // 4. Initialize partition discovery scheduler
+            this.knownPartitionCount = partitionInfos.size();
+            if (partitionDiscoveryIntervalMs > 0) {
+                this.partitionDiscoveryScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "auron-kafka-partition-discovery-" + subtaskIndex);
+                    t.setDaemon(true);
+                    return t;
+                });
+                partitionDiscoveryScheduler.scheduleWithFixedDelay(
+                        () -> discoverNewPartitions(subtaskIndex, numSubtasks),
+                        partitionDiscoveryIntervalMs,
+                        partitionDiscoveryIntervalMs,
+                        TimeUnit.MILLISECONDS);
+                LOG.info(
+                        "Partition discovery enabled for subtask {} with interval {}ms",
+                        subtaskIndex,
+                        partitionDiscoveryIntervalMs);
+            }
+        }
+        sourcePlan.setKafkaScan(scanExecNode.build());
+        this.physicalPlanNode = sourcePlan.build();
+
+        this.physicalPlanNode = applyMergedCalcPlan(this.physicalPlanNode);
+
+        // 3. Initialize per-partition WatermarkGenerators if watermarkStrategy is set
+        if (watermarkStrategy != null) {
+            MetricGroup metricGroup = runtimeContext.getMetricGroup();
+            this.partitionWatermarkTrackers = new HashMap<>();
+            this.combinedWatermark = Long.MIN_VALUE;
+            this.allPartitionsIdle = false;
+
+            for (int partitionId : assignedPartitions) {
+                org.apache.flink.api.common.eventtime.WatermarkGenerator<RowData> generator =
+                        watermarkStrategy.createWatermarkGenerator(() -> metricGroup);
+                partitionWatermarkTrackers.put(partitionId, new PartitionWatermarkTracker(generator));
+            }
+        }
+
+        // Mark the source as running only after initialization completes. The run() loop
+        // collects rows only while isRunning is true on both the watermark and no-watermark
+        // paths, so this must be set regardless of whether a watermark strategy is present.
+        this.isRunning = true;
+    }
+
+    /**
+     * Applies a staged merged Calc sub-plan to {@code sourcePlan}, returning the fused plan; returns
+     * {@code sourcePlan} unchanged when no plan is staged.
+     *
+     * <p>Enforces the invariant that a merged plan must never be staged on a watermarked source. The
+     * fusion processor already gates on {@link #hasWatermark()} at plan time so a watermarked source
+     * is never staged; this is the runtime backstop for that gate. Fusing a Calc below the source's
+     * per-record watermark generator would strip the event-time timestamps the generator depends on,
+     * silently corrupting event-time progress. By the time this runs the planner has already committed
+     * to fusion (the downstream Calc was re-typed to the projected output and emitted no standalone
+     * operator), so the source cannot safely fall back to an unfused plan — the only correct action on
+     * a watermark + staged-plan coexistence is to fail fast.
+     *
+     * @param sourcePlan the freshly-built {@code KafkaScan} plan
+     * @return the fused {@code Project[Filter?[KafkaScan]]} plan when a plan is staged, else {@code sourcePlan}
+     * @throws IllegalStateException if a merged plan is staged while a watermark strategy is configured
+     */
+    @VisibleForTesting
+    PhysicalPlanNode applyMergedCalcPlan(PhysicalPlanNode sourcePlan) {
+        if (mergedCalcPlan == null) {
+            return sourcePlan;
+        }
+        if (watermarkStrategy != null) {
+            throw new IllegalStateException(
+                    "A merged Calc plan was staged on a watermarked Kafka source. The fusion processor "
+                            + "must never stage a plan on a source that carries a watermark: fusing the Calc "
+                            + "below the source's per-record watermark generator strips the per-record "
+                            + "event-time timestamps and corrupts event-time progress. This open()-time guard "
+                            + "is the runtime backstop for the planner-time hasWatermark() gate.");
+        }
+        // Fuse: replace the FFIReader placeholder leaf of the logical Calc sub-plan with the
+        // freshly-built KafkaScan, and prepend the 3 Kafka metadata passthrough columns to the
+        // outer Projection so the fused output stays [partition, offset, timestamp, ...projected].
+        return buildMergedPlan(mergedCalcPlan, sourcePlan);
+    }
+
+    @Override
+    public void run(SourceContext<RowData> sourceContext) throws Exception {
+        metricGroup = getRuntimeContext().getMetricGroup();
+        final Map<String, Counter> flinkCounters = new HashMap<>();
+
+        nativeMetric = new MetricNode(new ArrayList<>()) {
+            @Override
+            public void add(String name, long value) {
+                // Integration with Flink metrics
+                Counter counter = flinkCounters.get(name);
+                if (counter == null) {
+                    counter = metricGroup.counter(name);
+                    flinkCounters.put(name, counter);
+                }
+                counter.inc(value);
+                LOG.debug("Metric Auron Source: {} = {}", name, value);
+            }
+        };
+        // The native output carries [meta, logical], where logical is the projected output when a
+        // merged Calc plan is active and the original output otherwise. The metadata column count
+        // and per-field positions both derive from KAFKA_AURON_META_FIELDS so adding or reordering
+        // a metadata column does not require editing this loop.
+        final int metaCount = KAFKA_AURON_META_FIELDS.size();
+        List<RowType.RowField> fieldList = new LinkedList<>(KAFKA_AURON_META_FIELDS);
+        fieldList.addAll(effectiveLogicalOutputType().getFields());
+        RowType auronOutputRowType = new RowType(fieldList);
+
+        // Negative indices of the metadata columns relative to the row end: a meta field at
+        // physical position p sits at (p - metaCount). The accessor type per field (INT vs BIGINT)
+        // is intrinsic to that field; only the offset magnitude comes from the constant.
+        final int partitionIdx = metaFieldNegativeIndex(KAFKA_AURON_META_PARTITION_ID);
+        final int offsetIdx = metaFieldNegativeIndex(KAFKA_AURON_META_OFFSET);
+        final int timestampIdx = metaFieldNegativeIndex(KAFKA_AURON_META_TIMESTAMP);
+
+        // Pre-check watermark flag to avoid per-record null checks in the hot path
+        final boolean enableWatermark = partitionWatermarkTrackers != null && !partitionWatermarkTrackers.isEmpty();
+
+        AuronCallNativeWrapper wrapper = new AuronCallNativeWrapper(
+                FlinkArrowUtils.getRootAllocator(),
+                physicalPlanNode,
+                nativeMetric,
+                0,
+                0,
+                0,
+                AuronAdaptor.getInstance().getAuronConfiguration().getLong(FlinkAuronConfiguration.NATIVE_MEMORY_SIZE));
+
+        if (enableWatermark) {
+            // Per-partition watermark path: each partition has its own WatermarkGenerator
+            // with a capture-only WatermarkOutput. Combined watermark = min(non-idle partitions).
+            while (wrapper.loadNextBatch(batch -> {
+                if (isRunning) {
+                    Map<Integer, Long> tmpOffsets = new HashMap<>(currentOffsets);
+                    FlinkArrowReader arrowReader = FlinkArrowReader.create(batch, auronOutputRowType, metaCount);
+                    for (int i = 0; i < batch.getRowCount(); i++) {
+                        AuronColumnarRowData tmpRowData = (AuronColumnarRowData) arrowReader.read(i);
+                        int partitionId = tmpRowData.getInt(partitionIdx);
+                        long offset = tmpRowData.getLong(offsetIdx);
+                        long kafkaTimestamp = tmpRowData.getLong(timestampIdx);
+                        tmpOffsets.put(partitionId, offset);
+
+                        // Feed into the partition's own generator (output captures, does NOT forward)
+                        PartitionWatermarkTracker tracker = getOrCreateTracker(partitionId);
+                        tracker.generator.onEvent(tmpRowData, kafkaTimestamp, tracker.output);
+
+                        sourceContext.collectWithTimestamp(tmpRowData, kafkaTimestamp);
+                    }
+                    // After batch: trigger onPeriodicEmit for all partitions, then combine and emit
+                    for (PartitionWatermarkTracker tracker : partitionWatermarkTrackers.values()) {
+                        tracker.generator.onPeriodicEmit(tracker.output);
+                    }
+                    emitCombinedWatermark(sourceContext);
+                    synchronized (lock) {
+                        currentOffsets = tmpOffsets;
+                    }
+                }
+            })) {}
+        } else {
+            // No-watermark path: still use collectWithTimestamp with kafka timestamp
+            while (wrapper.loadNextBatch(batch -> {
+                if (isRunning) {
+                    Map<Integer, Long> tmpOffsets = new HashMap<>(currentOffsets);
+                    FlinkArrowReader arrowReader = FlinkArrowReader.create(batch, auronOutputRowType, metaCount);
+                    for (int i = 0; i < batch.getRowCount(); i++) {
+                        AuronColumnarRowData tmpRowData = (AuronColumnarRowData) arrowReader.read(i);
+                        int partitionId = tmpRowData.getInt(partitionIdx);
+                        long offset = tmpRowData.getLong(offsetIdx);
+                        long kafkaTimestamp = tmpRowData.getLong(timestampIdx);
+                        tmpOffsets.put(partitionId, offset);
+                        sourceContext.collectWithTimestamp(tmpRowData, kafkaTimestamp);
+                    }
+                    synchronized (lock) {
+                        currentOffsets = tmpOffsets;
+                    }
+                }
+            })) {}
+        }
+        LOG.info("Auron kafka source run end");
+    }
+
+    @Override
+    public void cancel() {
+        this.isRunning = false;
+    }
+
+    @Override
+    public void close() throws Exception {
+        this.isRunning = false;
+
+        // Shut down partition discovery scheduler before closing the consumer it uses
+        if (partitionDiscoveryScheduler != null) {
+            try {
+                partitionDiscoveryScheduler.shutdownNow();
+            } catch (Exception e) {
+                LOG.warn("Fail to shut down kafka partition discovery thread pool", e);
+            }
+        }
+
+        // Close the metadata-only Kafka Consumer
+        if (kafkaConsumer != null) {
+            kafkaConsumer.close();
+        }
+
+        super.close();
+    }
+
+    @Override
+    public List<PhysicalPlanNode> getPhysicalPlanNodes() {
+        return Collections.singletonList(physicalPlanNode);
+    }
+
+    @Override
+    public RowType getOutputType() {
+        return effectiveLogicalOutputType();
+    }
+
+    /**
+     * The logical (metadata-excluded) output row type emitted downstream: the projected output type
+     * when a merged Calc plan is active, otherwise the original output type.
+     */
+    private RowType effectiveLogicalOutputType() {
+        return mergedProjectedOutputType != null ? mergedProjectedOutputType : (RowType) outputType;
+    }
+
+    @Override
+    public String getAuronOperatorId() {
+        return auronOperatorId;
+    }
+
+    @Override
+    public MetricNode getMetricNode() {
+        return nativeMetric;
+    }
+
+    @Override
+    public void notifyCheckpointComplete(long checkpointId) throws Exception {
+        try {
+            final int posInMap = pendingOffsetsToCommit.indexOf(checkpointId);
+            if (posInMap == -1) {
+                LOG.debug(
+                        "Consumer subtask {} received confirmation for unknown checkpoint id {}",
+                        getRuntimeContext().getIndexOfThisSubtask(),
+                        checkpointId);
+                return;
+            }
+
+            @SuppressWarnings("unchecked")
+            Map<Integer, Long> offsets = (Map<Integer, Long>) pendingOffsetsToCommit.remove(posInMap);
+
+            // remove older checkpoints in map
+            for (int i = 0; i < posInMap; i++) {
+                pendingOffsetsToCommit.remove(0);
+            }
+
+            int subTaskIndex = getRuntimeContext().getIndexOfThisSubtask();
+            if (offsets == null || offsets.size() == 0) {
+                LOG.info("Consumer subtask {} has empty checkpoint state.", subTaskIndex);
+                return;
+            }
+            String commitOffsetsKey = auronOperatorIdWithSubtaskIndex + "-offsets2commit";
+            LOG.info(
+                    "Subtask {} commit [{}] offsets for checkpoint: {}, offsets: {}",
+                    subTaskIndex,
+                    commitOffsetsKey,
+                    checkpointId,
+                    offsets);
+            JniBridge.putResource(commitOffsetsKey, mapper.writeValueAsString(offsets));
+        } catch (Exception e) {
+            LOG.error("NotifyCheckpointComplete error: ", e);
+            if (isRunning) {
+                throw e;
+            }
+        }
+    }
+
+    @Override
+    public void snapshotState(FunctionSnapshotContext context) throws Exception {
+        if (!isRunning) {
+            LOG.warn("Auron kafka source is not running, skip snapshot state");
+        } else {
+            Map<Integer, Long> copyCurrentOffsets;
+            synchronized (lock) {
+                // copy offsets, ensure that the corresponding offset has been dispatched to downstream.
+                copyCurrentOffsets = new HashMap<>(currentOffsets);
+            }
+            pendingOffsetsToCommit.put(context.getCheckpointId(), copyCurrentOffsets);
+            for (Map.Entry<Integer, Long> offset : copyCurrentOffsets.entrySet()) {
+                unionOffsetStates.add(Tuple2.of(new KafkaTopicPartition(topic, offset.getKey()), offset.getValue()));
+            }
+            LOG.info(
+                    "snapshotState for checkpointId: {}, currentOffsets: {}",
+                    context.getCheckpointId(),
+                    copyCurrentOffsets);
+        }
+    }
+
+    @Override
+    public void initializeState(FunctionInitializationContext context) throws Exception {
+        OperatorStateStore stateStore = context.getOperatorStateStore();
+        this.unionOffsetStates = stateStore.getUnionListState(new ListStateDescriptor<>(
+                OFFSETS_STATE_NAME, TypeInformation.of(new TypeHint<Tuple2<KafkaTopicPartition, Long>>() {})));
+        this.restoredOffsets = new HashMap<>();
+        if (context.isRestored()) {
+            for (Tuple2<KafkaTopicPartition, Long> kafkaTopicPartitionOffsetEntry : unionOffsetStates.get()) {
+                restoredOffsets.put(
+                        kafkaTopicPartitionOffsetEntry.f0.getPartition(), kafkaTopicPartitionOffsetEntry.f1);
+            }
+            LOG.info("Restore from state, restoredOffsets: {}", restoredOffsets);
+        } else {
+            LOG.info("Not restore from state.");
+        }
+    }
+
+    public void setWatermarkStrategy(WatermarkStrategy<RowData> watermarkStrategy) {
+        this.watermarkStrategy = watermarkStrategy;
+    }
+
+    /**
+     * Registers a logical Calc sub-plan to fuse into the Kafka source so the native engine runs a
+     * single {@code Project[Filter?[KafkaScan]]} plan instead of a bare {@code KafkaScan} feeding a
+     * separate downstream Calc operator.
+     *
+     * <p>The sub-plan is a {@code Project[Filter?[FFIReader-placeholder]]} tree built by the
+     * downstream Calc against the LOGICAL-only input columns; its FFIReader leaf carries the
+     * resource ID {@code "placeholder"}. At {@code open()} the placeholder leaf is replaced by the
+     * freshly-built {@code KafkaScan} and the three Kafka metadata passthrough columns are prepended
+     * to the outer projection, so the fused output is {@code [partition, offset, timestamp,
+     * ...projected-logical]}.
+     *
+     * @param logicalCalcSubPlan the {@code Project[Filter?[FFIReader-placeholder]]} tree over the
+     *     logical input columns
+     * @param projectedOutputType the projected logical output row type (without the metadata
+     *     columns) emitted downstream when the fused plan is active
+     */
+    @Override
+    public void setMergedCalcPlan(PhysicalPlanNode logicalCalcSubPlan, RowType projectedOutputType) {
+        Preconditions.checkArgument(logicalCalcSubPlan != null, "Merged Calc plan must not be null");
+        Preconditions.checkArgument(projectedOutputType != null, "Projected output type must not be null");
+        Preconditions.checkState(!isMergedCalcPlanSet(), "A merged Calc plan is already staged on this source");
+        this.mergedCalcPlan = logicalCalcSubPlan;
+        this.mergedProjectedOutputType = projectedOutputType;
+    }
+
+    /**
+     * Reports whether this source has a watermark strategy configured. The fusion processor reads
+     * this at plan time and never stages a merged Calc plan on a watermarked source; {@link
+     * #applyMergedCalcPlan} re-checks the same condition at {@code open()} and fails fast if the two
+     * ever coexist.
+     *
+     * @return {@code true} if a {@link WatermarkStrategy} was set
+     */
+    @Override
+    public boolean hasWatermark() {
+        return watermarkStrategy != null;
+    }
+
+    /**
+     * Reports whether a merged Calc sub-plan has already been registered on this source. Guards
+     * against overwriting an already-fused plan, which would silently discard the first
+     * registration's logic.
+     *
+     * @return {@code true} if {@link #setMergedCalcPlan} has already been called
+     */
+    @Override
+    public boolean isMergedCalcPlanSet() {
+        return mergedCalcPlan != null;
+    }
+
+    public void setMockData(String mockData) {
+        Preconditions.checkArgument(mockData != null, "Auron kafka source mock data must not null");
+        this.mockData = mockData;
+    }
+
+    private void discoverNewPartitions(int subtaskIndex, int numSubtasks) {
+        if (isRunning) {
+            try {
+                List<PartitionInfo> currentPartitionInfos = kafkaConsumer.partitionsFor(topic);
+                int currentPartitionCount = currentPartitionInfos.size();
+
+                if (currentPartitionCount > knownPartitionCount) {
+                    LOG.info(
+                            "Discovered new partitions for topic {}: {} -> {}",
+                            topic,
+                            knownPartitionCount,
+                            currentPartitionCount);
+
+                    // Always send all new partitions since initialPartitionCount (not incremental)
+                    List<Integer> allNewPartitionsForThisSubtask = new ArrayList<>();
+                    for (PartitionInfo partitionInfo : currentPartitionInfos) {
+                        int partitionId = partitionInfo.partition();
+                        if (partitionId >= knownPartitionCount) {
+                            if (KafkaTopicPartitionAssigner.assign(topic, partitionId, numSubtasks) == subtaskIndex) {
+                                allNewPartitionsForThisSubtask.add(partitionId);
+                            }
+                        }
+                    }
+
+                    if (!allNewPartitionsForThisSubtask.isEmpty()) {
+                        String newPartitionsKey = auronOperatorIdWithSubtaskIndex + "-new-partitions";
+                        LOG.info(
+                                "Subtask {} discovered new partitions to consume: {}",
+                                subtaskIndex,
+                                allNewPartitionsForThisSubtask);
+                        JniBridge.putResource(
+                                newPartitionsKey, mapper.writeValueAsString(allNewPartitionsForThisSubtask));
+                    }
+
+                    knownPartitionCount = currentPartitionCount;
+                }
+            } catch (Exception e) {
+                LOG.warn("Error discovering new partitions for topic {}: {}", topic, e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Fuses a logical Calc sub-plan with the source's {@code KafkaScan} into a single native plan.
+     *
+     * <p>Two steps: (1) replace the {@code FFIReader} placeholder leaf of {@code logicalSubPlan}
+     * with {@code kafkaScan}; (2) prepend the three Kafka metadata passthrough columns to the outer
+     * {@link ProjectionExecNode} so the fused output stays {@code [partition, offset, timestamp,
+     * ...projected-logical]}.
+     *
+     * <p>The inner projection's logical exprs reference logical column NAMES. The native planner
+     * resolves a {@code PhysicalColumn} by name against the input schema, ignoring the proto index,
+     * so the logical exprs resolve correctly against the KafkaScan output schema {@code [meta3,
+     * ...logical]} with no ordinal shift.
+     *
+     * @param logicalSubPlan a {@code Project[Filter?[FFIReader-placeholder]]} tree
+     * @param kafkaScan the {@code KafkaScan} {@link PhysicalPlanNode} to splice in as the leaf
+     * @return the fused {@code Project[Filter?[KafkaScan]]} tree with metadata passthrough prepended
+     */
+    static PhysicalPlanNode buildMergedPlan(PhysicalPlanNode logicalSubPlan, PhysicalPlanNode kafkaScan) {
+        PhysicalPlanNode spliced = spliceScanIntoLeaf(logicalSubPlan, kafkaScan);
+        return prependMetadataPassthrough(spliced);
+    }
+
+    /**
+     * Recursively walks {@code node}, locating the {@code FFIReader} leaf and replacing the whole
+     * FFIReader-bearing {@link PhysicalPlanNode} with {@code kafkaScan}. Accepted shapes:
+     * {@code Project[FFIReader]} and {@code Project[Filter[FFIReader]]} (the Calc always wraps its
+     * output in a projection).
+     */
+    private static PhysicalPlanNode spliceScanIntoLeaf(PhysicalPlanNode node, PhysicalPlanNode kafkaScan) {
+        return AuronPlanTreeRewriter.rewriteFfiReaderLeaf(
+                node,
+                ffiReaderLeaf -> kafkaScan,
+                "Merged Calc sub-plan expects Project[Filter?[FFIReader]] shape; got: ");
+    }
+
+    /**
+     * Prepends the three Kafka metadata passthrough columns (partition, offset, timestamp) to the
+     * outer {@link ProjectionExecNode}'s parallel {@code expr} / {@code expr_name} / {@code
+     * data_type} lists, so the fused output stays {@code [partition, offset, timestamp,
+     * ...projected-logical]}.
+     */
+    private static PhysicalPlanNode prependMetadataPassthrough(PhysicalPlanNode merged) {
+        if (!merged.hasProjection()) {
+            throw new IllegalArgumentException(
+                    "Merged Calc sub-plan expects a Projection root to prepend metadata passthrough; got: "
+                            + merged.getPhysicalPlanTypeCase());
+        }
+        ProjectionExecNode projection = merged.getProjection();
+        List<PhysicalExprNode> originalExprs = new ArrayList<>(projection.getExprList());
+        List<String> originalNames = new ArrayList<>(projection.getExprNameList());
+        List<ArrowType> originalTypes = new ArrayList<>(projection.getDataTypeList());
+
+        for (RowType.RowField metaField : KAFKA_AURON_META_FIELDS) {
+            if (originalNames.contains(metaField.getName())) {
+                throw new IllegalArgumentException("Logical projected column name '" + metaField.getName()
+                        + "' collides with a reserved Kafka metadata column; rename the column to fuse the Calc");
+            }
+        }
+
+        ProjectionExecNode.Builder rebuilt =
+                projection.toBuilder().clearExpr().clearExprName().clearDataType();
+        for (RowType.RowField metaField : KAFKA_AURON_META_FIELDS) {
+            addMetadataColumn(rebuilt, metaField.getName(), metaField.getType());
+        }
+        rebuilt.addAllExpr(originalExprs).addAllExprName(originalNames).addAllDataType(originalTypes);
+
+        return merged.toBuilder().setProjection(rebuilt.build()).build();
+    }
+
+    /**
+     * Resolves the negative (row-end-relative) index of the metadata column named {@code fieldName}.
+     * Metadata columns occupy the leading positions of every native output row, so a field at
+     * physical position {@code p} reads back at {@code p - KAFKA_AURON_META_FIELDS.size()}.
+     *
+     * @param fieldName the metadata column name, declared in {@link KafkaConstants#KAFKA_AURON_META_FIELDS}
+     * @return the negative index to pass to the row accessors for this metadata column
+     */
+    @VisibleForTesting
+    static int metaFieldNegativeIndex(String fieldName) {
+        final int metaCount = KAFKA_AURON_META_FIELDS.size();
+        for (int p = 0; p < KAFKA_AURON_META_FIELDS.size(); p++) {
+            if (KAFKA_AURON_META_FIELDS.get(p).getName().equals(fieldName)) {
+                return p - metaCount;
+            }
+        }
+        throw new IllegalStateException("Unknown Kafka metadata field: " + fieldName);
+    }
+
+    private static void addMetadataColumn(ProjectionExecNode.Builder builder, String name, LogicalType type) {
+        builder.addExpr(PhysicalExprNode.newBuilder()
+                        .setColumn(PhysicalColumn.newBuilder().setName(name).build())
+                        .build())
+                .addExprName(name)
+                .addDataType(SchemaConverters.convertToAuronArrowType(type));
+    }
+
+    /**
+     * Compute min(non-idle partition watermarks) and emit to sourceContext if it advanced.
+     * If all partitions are idle, mark the source as temporarily idle.
+     * This is the ONLY path that emits watermarks to sourceContext.
+     */
+    private void emitCombinedWatermark(SourceContext<RowData> sourceContext) {
+        long minWatermark = Long.MAX_VALUE;
+        boolean allIdle = true;
+
+        for (PartitionWatermarkTracker tracker : partitionWatermarkTrackers.values()) {
+            if (!tracker.idle) {
+                minWatermark = Math.min(minWatermark, tracker.currentWatermark);
+                allIdle = false;
+            }
+        }
+
+        if (allIdle) {
+            if (!allPartitionsIdle) {
+                allPartitionsIdle = true;
+                sourceContext.markAsTemporarilyIdle();
+            }
+        } else {
+            allPartitionsIdle = false;
+            if (minWatermark > combinedWatermark && minWatermark < Long.MAX_VALUE) {
+                combinedWatermark = minWatermark;
+                sourceContext.emitWatermark(new Watermark(combinedWatermark));
+            }
+        }
+    }
+
+    /**
+     * Get or create a watermark tracker for the given partition.
+     * Supports dynamically discovered partitions.
+     */
+    private PartitionWatermarkTracker getOrCreateTracker(int partitionId) {
+        PartitionWatermarkTracker tracker = partitionWatermarkTrackers.get(partitionId);
+        if (tracker == null) {
+            MetricGroup metricGroup = getRuntimeContext().getMetricGroup();
+            org.apache.flink.api.common.eventtime.WatermarkGenerator<RowData> generator =
+                    watermarkStrategy.createWatermarkGenerator(() -> metricGroup);
+            tracker = new PartitionWatermarkTracker(generator);
+            partitionWatermarkTrackers.put(partitionId, tracker);
+            LOG.info("Created watermark tracker for dynamically discovered partition {}", partitionId);
+        }
+        return tracker;
+    }
+
+    /**
+     * Per-partition watermark tracking. Each partition has its own WatermarkGenerator
+     * and a capture-only WatermarkOutput that stores watermark/idle state locally
+     * without forwarding to sourceContext.
+     */
+    private static class PartitionWatermarkTracker {
+        final org.apache.flink.api.common.eventtime.WatermarkGenerator<RowData> generator;
+        long currentWatermark = Long.MIN_VALUE;
+        boolean idle = false;
+
+        final WatermarkOutput output = new WatermarkOutput() {
+            @Override
+            public void emitWatermark(org.apache.flink.api.common.eventtime.Watermark watermark) {
+                currentWatermark = Math.max(currentWatermark, watermark.getTimestamp());
+                idle = false;
+            }
+
+            @Override
+            public void markIdle() {
+                idle = true;
+            }
+
+            @Override
+            public void markActive() {
+                idle = false;
+            }
+        };
+
+        PartitionWatermarkTracker(org.apache.flink.api.common.eventtime.WatermarkGenerator<RowData> generator) {
+            this.generator = generator;
+        }
+    }
+}

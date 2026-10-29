@@ -1,0 +1,68 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+name: Style check
+
+on:
+  push:
+    branches:
+      - master
+      - branch-*
+  pull_request:
+    branches:
+      - master
+      - branch-*
+
+concurrency:
+  group: style-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  style:
+    name: Style
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup JDK 8
+        id: jdk8
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'adopt-hotspot'
+          java-version: 8
+          cache: 'maven'
+          check-latest: false
+      - name: Setup JDK 17
+        id: jdk17
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: 17
+          cache: 'maven'
+          check-latest: false
+
+      - name: Setup vendors
+        shell: bash
+        run: |
+          dev/vendors/setup-vendors.sh
+
+      - run: |
+          ./dev/reformat --check
+        env:
+          JAVA_HOME_8: ${{ steps.jdk8.outputs.java-home }}
+          JAVA_HOME_17: ${{ steps.jdk17.outputs.java-home }}

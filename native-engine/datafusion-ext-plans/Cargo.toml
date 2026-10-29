@@ -1,0 +1,76 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+[package]
+name = "datafusion-ext-plans"
+version = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+
+[lints]
+workspace = true
+
+[features]
+default = ["tokio/rt-multi-thread"]
+
+[dependencies]
+arrow = { workspace = true }
+arrow-schema = { workspace = true }
+auron-jni-bridge = { workspace = true }
+auron-memmgr = { workspace = true }
+datafusion = { workspace = true }
+datafusion-datasource = { workspace = true }
+datafusion-datasource-parquet = { workspace = true }
+datafusion-ext-commons = { workspace = true }
+datafusion-ext-exprs = { workspace = true }
+datafusion-ext-functions = { workspace = true }
+orc-rust = { workspace = true }
+
+async-trait = { workspace = true }
+base64 = { workspace = true }
+bitvec = { workspace = true }
+byteorder = { workspace = true }
+bytes = { workspace = true }
+bytesize = { workspace = true }
+count-write = { workspace = true }
+foldhash = { workspace = true }
+futures = { workspace = true }
+futures-util = { workspace = true }
+hashbrown = { workspace = true }
+itertools = { workspace = true }
+jni = { workspace = true }
+log = { workspace = true }
+num = { workspace = true }
+object_store = { workspace = true }
+once_cell = { workspace = true }
+panic-message = { workspace = true }
+parking_lot = { workspace = true }
+paste = { workspace = true }
+smallvec = { workspace = true }
+tokio = { workspace = true }
+unchecked-index = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+prost-reflect = { workspace = true }
+rdkafka = { workspace = true }
+sonic-rs = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+procfs = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }

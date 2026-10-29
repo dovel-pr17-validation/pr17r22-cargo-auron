@@ -1,0 +1,217 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one or more
+  ~ contributor license agreements.  See the NOTICE file distributed with
+  ~ this work for additional information regarding copyright ownership.
+  ~ The ASF licenses this file to You under the Apache License, Version 2.0
+  ~ (the "License"); you may not use this file except in compliance with
+  ~ the License.  You may obtain a copy of the License at
+  ~
+  ~    http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing, software
+  ~ distributed under the License is distributed on an "AS IS" BASIS,
+  ~ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  ~ See the License for the specific language governing permissions and
+  ~ limitations under the License.
+  -->
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.apache.auron</groupId>
+    <artifactId>auron-parent_${scalaVersion}</artifactId>
+    <version>${project.version}</version>
+    <relativePath>../../../pom.xml</relativePath>
+  </parent>
+  <artifactId>auron-${shimName}_${scalaVersion}</artifactId>
+  <packaging>jar</packaging>
+  <name>Apache Auron Assembly</name>
+  <description>Apache Auron Assembly Project</description>
+
+  <properties>
+    <auron.shade.packageName>auron</auron.shade.packageName>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.auron</groupId>
+      <artifactId>spark-extension_${scalaVersion}</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.auron</groupId>
+      <artifactId>spark-extension-shims-spark_${scalaVersion}</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-buffer</artifactId>
+      <version>${nettyVersion}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-common</artifactId>
+      <version>${nettyVersion}</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- create uber jar -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>${maven.plugin.shade.version}</version>
+        <configuration>
+          <finalName>auron-${shimName}_${scalaVersion}-${project.version}</finalName>
+        </configuration>
+        <executions>
+          <execution>
+            <goals>
+              <goal>shade</goal>
+            </goals>
+            <phase>package</phase>
+            <configuration>
+              <createDependencyReducedPom>false</createDependencyReducedPom>
+              <artifactSet>
+                <excludes>
+                  <exclude>*:commons-codec</exclude>
+                  <exclude>*:commons-compress</exclude>
+                  <exclude>*:commons-io</exclude>
+                  <exclude>*:commons-lang3</exclude>
+                  <exclude>*:jackson-*</exclude>
+                  <exclude>*:log4j-*</exclude>
+                  <exclude>*:slf4j-*</exclude>
+                  <exclude>*:zstd-jni</exclude>
+                  <exclude>*:scala-library</exclude>
+                  <exclude>*:scala-reflect</exclude>
+                </excludes>
+              </artifactSet>
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <exclude>org/apache/commons/codec/**/*</exclude>
+                    <exclude>org/apache/commons/compress/**/*</exclude>
+                    <exclude>org/slf4j/**/*</exclude>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                    <exclude>META-INF/**/module-info.class</exclude>
+                    <exclude>**/*.semanticdb</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+              <relocations>
+                <relocation>
+                  <pattern>com.google.flatbuffers</pattern>
+                  <shadedPattern>${auron.shade.packageName}.com.google.flatbuffers</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>com.google.protobuf</pattern>
+                  <shadedPattern>${auron.shade.packageName}.com.google.protobuf</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>org.apache.arrow</pattern>
+                  <shadedPattern>${auron.shade.packageName}.org.apache.arrow</shadedPattern>
+                  <!--arrow's C and dataset wrapper refers to the original class path, so we should not relocate here-->
+                  <excludes>
+                    <exclude>org.apache.arrow.c.**</exclude>
+                  </excludes>
+                </relocation>
+                <relocation>
+                  <pattern>io.netty</pattern>
+                  <shadedPattern>${auron.shade.packageName}.io.netty</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>javax.annotation</pattern>
+                  <shadedPattern>${auron.shade.packageName}.javax.annotation</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>net.bytebuddy</pattern>
+                  <shadedPattern>${auron.shade.packageName}.net.bytebuddy</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>org.checkerframework</pattern>
+                  <shadedPattern>${auron.shade.packageName}.org.checkerframework</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>scala.compat</pattern>
+                  <shadedPattern>${auron.shade.packageName}.scala.compat</shadedPattern>
+                </relocation>
+              </relocations>
+              <archive>
+                <addMavenDescriptor>false</addMavenDescriptor>
+              </archive>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>${exec-maven-plugin.version}</version>
+        <executions>
+          <execution>
+            <id>copy-fat-jar</id>
+            <goals>
+              <goal>exec</goal>
+            </goals>
+            <phase>package</phase>
+            <configuration>
+              <executable>cp</executable>
+              <arguments>
+                <argument>target/auron-${shimName}_${scalaVersion}-${project.version}.jar</argument>
+                <argument>../../../target/auron-${shimName}_${scalaVersion}-${releaseMode}-${os.detected.classifier}-${project.version}.jar</argument>
+              </arguments>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+    <extensions>
+      <!-- provides os.detected.classifier (i.e. linux-x86_64, osx-x86_64) property -->
+      <extension>
+        <groupId>kr.motd.maven</groupId>
+        <artifactId>os-maven-plugin</artifactId>
+        <version>${os-maven-plugin.version}</version>
+      </extension>
+    </extensions>
+  </build>
+
+  <profiles>
+    <profile>
+      <id>celeborn</id>
+      <dependencies>
+        <dependency>
+          <groupId>org.apache.auron</groupId>
+          <artifactId>auron-celeborn_${scalaVersion}</artifactId>
+          <version>${project.version}</version>
+        </dependency>
+      </dependencies>
+    </profile>
+
+    <profile>
+      <id>uniffle</id>
+      <dependencies>
+        <dependency>
+          <groupId>org.apache.auron</groupId>
+          <artifactId>auron-uniffle_${scalaVersion}</artifactId>
+          <version>${project.version}</version>
+        </dependency>
+      </dependencies>
+    </profile>
+
+    <profile>
+      <id>paimon</id>
+      <dependencies>
+        <dependency>
+          <groupId>org.apache.auron</groupId>
+          <artifactId>auron-paimon_${scalaVersion}</artifactId>
+          <version>${project.version}</version>
+        </dependency>
+      </dependencies>
+    </profile>
+  </profiles>
+</project>

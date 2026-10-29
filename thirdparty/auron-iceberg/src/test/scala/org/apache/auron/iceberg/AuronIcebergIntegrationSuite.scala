@@ -1,0 +1,1718 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.auron.iceberg
+
+import java.util.{Locale, UUID}
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+
+import scala.collection.JavaConverters._
+import scala.util.control.NonFatal
+
+import org.apache.iceberg.{AddedRowsScanTask, ChangelogScanTask, DeletedDataFileScanTask, FileFormat, FileScanTask, MetadataColumns, PartitionData, ScanTask}
+import org.apache.iceberg.data.{GenericAppenderFactory, GenericRecord, Record}
+import org.apache.iceberg.deletes.PositionDelete
+import org.apache.iceberg.spark.Spark3Util
+import org.apache.spark.scheduler.{SparkListener, SparkListenerEvent}
+import org.apache.spark.sql.{DataFrame, Row}
+import org.apache.spark.sql.auron.AuronColumnarOverrides
+import org.apache.spark.sql.auron.iceberg.{IcebergConvertProvider, IcebergScanSupport}
+import org.apache.spark.sql.catalyst.CatalystTypeConverters
+import org.apache.spark.sql.catalyst.expressions.{Add, Alias, And, Attribute, EqualTo, Expression, GreaterThan, In, Literal, Not, Or, Rand}
+import org.apache.spark.sql.catalyst.trees.TreeNodeTag
+import org.apache.spark.sql.execution.{FilterExec, FormattedMode, ProjectExec, SparkPlan}
+import org.apache.spark.sql.execution.ExplainUtils.collectFirst
+import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, QueryStageExec}
+import org.apache.spark.sql.execution.auron.plan.NativeIcebergTableScanExec
+import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
+import org.apache.spark.sql.execution.ui.SparkListenerDriverAccumUpdates
+
+class AuronIcebergIntegrationSuite
+    extends org.apache.spark.sql.QueryTest
+    with BaseAuronIcebergSuite {
+
+  test("iceberg native scan with auron.enable.iceberg.scan=false") {
+    withTable("local.db.t2") {
+      withSQLConf("spark.auron.enabled" -> "true", "spark.auron.enable.iceberg.scan" -> "false") {
+        sql("create table local.db.t2 using iceberg as select 1 as id, 'a' as v")
+        val df = sql("select * from local.db.t2")
+        df.collect()
+        val neverConvertReasonTag: TreeNodeTag[String] = TreeNodeTag("auron.never.convert.reason")
+        assert(collectFirst(df.queryExecution.executedPlan) { case batchScanExec: BatchScanExec =>
+          batchScanExec.getTagValue(neverConvertReasonTag)
+        }.get.get.equals("Conversion disabled: auron.enable.iceberg.scan=false."))
+      }
+    }
+  }
+
+  test(
+    "iceberg scan falls back when reading unsupported metadata columns and check never convert reason") {
+    withTable("local.db.t4_pos") {
+      sql("create table local.db.t4_pos using iceberg as select 1 as id, 'a' as v")
+      withSQLConf("spark.auron.enabled" -> "true", "spark.auron.enable.iceberg.scan" -> "true") {
+        val df = sql("select _pos from local.db.t4_pos")
+        df.collect()
+        val neverConvertReasonTag: TreeNodeTag[String] = TreeNodeTag("auron.never.convert.reason")
+        assert(collectFirst(df.queryExecution.executedPlan) { case batchScanExec: BatchScanExec =>
+          batchScanExec.getTagValue(neverConvertReasonTag)
+        }.get.get.equals("Has per-row materialization (for example _pos)."))
+      }
+    }
+  }
+
+  test("test iceberg integrate ") {
+    withTable("local.db.t1") {
+      sql(
+        "create table local.db.t1 using iceberg PARTITIONED BY (part) as select 1 as c1, 2 as c2, 'test test' as part")
+      val df = sql("select * from local.db.t1")
+      checkAnswer(df, Seq(Row(1, 2, "test test")))
+    }
+  }
+
+  test("iceberg native scan is applied for simple COW table") {
+    withTable("local.db.t2") {
+      sql("create table local.db.t2 using iceberg as select 1 as id, 'a' as v")
+      val df = sql("select * from local.db.t2")
+      df.collect()
+      val plan = df.queryExecution.executedPlan.toString()
+      assert(plan.contains("NativeIcebergTableScan"))
+    }
+  }
+
+  test("iceberg native scan exposes file scan driver metrics") {
+    withTable("local.db.t_metrics") {
+      sql("create table local.db.t_metrics using iceberg as select 1 as id, 'a' as v")
+      withSQLConf("spark.sql.adaptive.enabled" -> "false") {
+        val df = sql("select * from local.db.t_metrics")
+        val nativeScan = executedNativeIcebergTableScanExec(df)
+        val metricIds = Map(
+          "numPartitions" -> nativeScan.metrics("numPartitions").id,
+          "numFiles" -> nativeScan.metrics("numFiles").id)
+        val driverMetricUpdates = new ConcurrentLinkedQueue[(Long, Long)]()
+        val driverMetricUpdatesPosted = new CountDownLatch(1)
+        val listener = new SparkListener {
+          override def onOtherEvent(event: SparkListenerEvent): Unit = event match {
+            case SparkListenerDriverAccumUpdates(_, updates) =>
+              updates.foreach { case (metricId, value) =>
+                driverMetricUpdates.add(metricId -> value)
+              }
+              val updatedMetricIds = driverMetricUpdates.iterator().asScala.map(_._1).toSet
+              if (metricIds.values.forall(updatedMetricIds.contains)) {
+                driverMetricUpdatesPosted.countDown()
+              }
+            case _ =>
+          }
+        }
+
+        spark.sparkContext.addSparkListener(listener)
+        try {
+          checkAnswer(df, Seq(Row(1, "a")))
+          assert(driverMetricUpdatesPosted.await(30, TimeUnit.SECONDS))
+        } finally {
+          spark.sparkContext.removeSparkListener(listener)
+        }
+
+        val driverMetricValues = driverMetricUpdates
+          .iterator()
+          .asScala
+          .toSeq
+          .groupBy(_._1)
+          .mapValues(_.map(_._2).sum)
+          .toMap
+        assert(driverMetricValues.getOrElse(metricIds("numPartitions"), 0L) > 0)
+        assert(driverMetricValues.getOrElse(metricIds("numFiles"), 0L) > 0)
+      }
+    }
+  }
+
+  test("iceberg native scan is applied for empty COW table") {
+    withTable("local.db.t_empty") {
+      sql("""
+            |create table local.db.t_empty (id int, v string)
+            |using iceberg
+            |tblproperties (
+            |  'format-version' = '2'
+            |)
+            |""".stripMargin)
+      val df = sql("select * from local.db.t_empty")
+      checkAnswer(df, Seq.empty)
+      val plan = df.queryExecution.executedPlan.toString()
+      assert(plan.contains("NativeIcebergTableScan"))
+    }
+  }
+
+  test("iceberg native scan is applied for projection on COW table") {
+    withTable("local.db.t3") {
+      sql("create table local.db.t3 using iceberg as select 1 as id, 'a' as v")
+      val df = sql("select id from local.db.t3")
+      checkAnswer(df, Seq(Row(1)))
+      val plan = df.queryExecution.executedPlan.toString()
+      assert(plan.contains("NativeIcebergTableScan"))
+    }
+  }
+
+  Seq("parquet", "orc").foreach { format =>
+    test(s"iceberg native scan fills omitted identity partition columns: $format") {
+      withTable("local.db.t_identity") {
+        sql("""CREATE TABLE local.db.t_identity (id INT, p STRING, d DATE, amount DECIMAL(8, 2))
+            |USING iceberg PARTITIONED BY (amount, p, d)""".stripMargin)
+        val table = Spark3Util.loadIcebergTable(spark, "local.db.t_identity")
+        val dataSchema = table.schema().select("id")
+        val append = table.newAppend()
+        Seq("east", "west", null).zipWithIndex.foreach { case (value, index) =>
+          val partition = new PartitionData(table.spec().partitionType())
+          partition.set(0, if (value == null) null else new java.math.BigDecimal("12.34"))
+          partition.set(1, value)
+          partition.set(2, if (value == null) null else Int.box(20000 + index))
+          val path = table.locationProvider().newDataLocation(s"identity-$index.$format")
+          val output = table.encryption().encrypt(table.io().newOutputFile(path))
+          val writer = new GenericAppenderFactory(dataSchema, table.spec())
+            .newDataWriter(output, FileFormat.fromString(format), partition)
+          val record = GenericRecord.create(dataSchema)
+          record.setField("id", Int.box(index))
+          try {
+            writer.write(record)
+          } finally {
+            writer.close()
+          }
+          append.appendFile(writer.toDataFile())
+        }
+        append.commit()
+
+        val df = checkSparkAnswerAndOperator("SELECT p, id FROM local.db.t_identity")
+        checkAnswer(df, Seq(Row("east", 0), Row("west", 1), Row(null, 2)))
+        checkSparkAnswerAndOperator("SELECT p FROM local.db.t_identity WHERE p = 'east'")
+        checkSparkAnswerAndOperator("SELECT p FROM local.db.t_identity WHERE p IS NULL")
+        checkSparkAnswerAndOperator("SELECT amount, d, p FROM local.db.t_identity")
+        checkSparkAnswerAndOperator("SELECT id, p, _file, _spec_id FROM local.db.t_identity")
+        checkSparkAnswerAndOperator(
+          "SELECT id, p, d, amount, _change_type FROM local.db.t_identity.changes")
+
+      }
+    }
+  }
+
+  test("iceberg native scan is applied for partitioned COW table with filter") {
+    withTable("local.db.t_partition") {
+      sql("""
+            |create table local.db.t_partition (id int, v string, p string)
+            |using iceberg
+            |partitioned by (p)
+            |""".stripMargin)
+      sql("insert into local.db.t_partition values (1, 'a', 'p1'), (2, 'b', 'p2')")
+      val df = sql("select * from local.db.t_partition where p = 'p1'")
+      checkAnswer(df, Seq(Row(1, "a", "p1")))
+      val plan = df.queryExecution.executedPlan.toString()
+      assert(plan.contains("NativeIcebergTableScan"))
+    }
+  }
+
+  test("iceberg native scan preserves dynamic pruning runtime filters") {
+    withTable("local.db.t_dpp_fact", "local.db.t_dpp_dim") {
+      sql("""
+            |create table local.db.t_dpp_fact (id int, v string, p int)
+            |using iceberg
+            |partitioned by (p)
+            |""".stripMargin)
+      sql("insert into local.db.t_dpp_fact values (1, 'a', 1), (2, 'b', 2), (3, 'c', 3)")
+      sql("create table local.db.t_dpp_dim using iceberg as select 1 as id, 2 as p")
+
+      withSQLConf(
+        "spark.auron.enabled" -> "true",
+        "spark.auron.enable.iceberg.scan" -> "true",
+        "spark.sql.optimizer.dynamicPartitionPruning.enabled" -> "true",
+        "spark.sql.optimizer.dynamicPartitionPruning.reuseBroadcastOnly" -> "true",
+        "spark.sql.autoBroadcastJoinThreshold" -> "1024") {
+        val df = sql("""
+            |select /*+ BROADCAST(d) */ f.id, f.v, f.p
+            |from local.db.t_dpp_fact f
+            |join local.db.t_dpp_dim d
+            |on f.p = d.p
+            |where d.id = 1
+            |""".stripMargin)
+
+        checkNativeDppScan(df, Seq(Row(2, "b", 2)), "t_dpp_fact", 1L, 1L)
+      }
+    }
+  }
+
+  test("iceberg native scan handles dynamic pruning to empty partitions") {
+    withTable("local.db.t_dpp_empty_fact", "local.db.t_dpp_empty_dim") {
+      sql("""
+            |create table local.db.t_dpp_empty_fact (id int, v string, p int)
+            |using iceberg
+            |partitioned by (p)
+            |""".stripMargin)
+      sql("""
+            |insert into local.db.t_dpp_empty_fact
+            |values (1, 'a', 1), (2, 'b', 2), (3, 'c', 3)
+            |""".stripMargin)
+      sql("create table local.db.t_dpp_empty_dim using iceberg as select 1 as id, 9 as p")
+
+      withSQLConf(
+        "spark.auron.enabled" -> "true",
+        "spark.auron.enable.iceberg.scan" -> "true",
+        "spark.sql.optimizer.dynamicPartitionPruning.enabled" -> "true",
+        "spark.sql.optimizer.dynamicPartitionPruning.reuseBroadcastOnly" -> "true",
+        "spark.sql.autoBroadcastJoinThreshold" -> "1024") {
+        val df = sql("""
+            |select /*+ BROADCAST(d) */ f.id, f.v, f.p
+            |from local.db.t_dpp_empty_fact f
+            |join local.db.t_dpp_empty_dim d
+            |on f.p = d.p
+            |where d.id = 1
+            |""".stripMargin)
+
+        checkNativeDppScan(df, Seq.empty[Row], "t_dpp_empty_fact", 0L, 0L)
+      }
+    }
+  }
+
+  test("iceberg native scan is applied for ORC COW table") {
+    withTable("local.db.t_orc") {
+      sql("""
+            |create table local.db.t_orc (id int, v string)
+            |using iceberg
+            |tblproperties ('write.format.default' = 'orc')
+            |""".stripMargin)
+      sql("insert into local.db.t_orc values (1, 'a'), (2, 'b')")
+      val df = sql("select * from local.db.t_orc")
+      checkAnswer(df, Seq(Row(1, "a"), Row(2, "b")))
+      val plan = df.queryExecution.executedPlan.toString()
+      assert(plan.contains("NativeIcebergTableScan"))
+    }
+  }
+
+  test("iceberg native ORC scan applies dynamic pruning runtime filters") {
+    withTable("local.db.t_orc_dpp_fact", "local.db.t_orc_dpp_dim") {
+      sql("""
+            |create table local.db.t_orc_dpp_fact (id int, v string, p int)
+            |using iceberg
+            |partitioned by (p)
+            |tblproperties ('write.format.default' = 'orc')
+            |""".stripMargin)
+      sql("""
+            |insert into local.db.t_orc_dpp_fact
+            |values (1, 'a', 1), (2, 'b', 2), (3, 'c', 3)
+            |""".stripMargin)
+      sql("create table local.db.t_orc_dpp_dim using iceberg as select 1 as id, 2 as p")
+
+      withSQLConf(
+        "spark.auron.enabled" -> "true",
+        "spark.auron.enable.iceberg.scan" -> "true",
+        "spark.sql.optimizer.dynamicPartitionPruning.enabled" -> "true",
+        "spark.sql.optimizer.dynamicPartitionPruning.reuseBroadcastOnly" -> "true",
+        "spark.sql.autoBroadcastJoinThreshold" -> "1024") {
+        val df = sql("""
+            |select /*+ BROADCAST(d) */ f.id, f.v, f.p
+            |from local.db.t_orc_dpp_fact f
+            |join local.db.t_orc_dpp_dim d
+            |on f.p = d.p
+            |where d.id = 1
+            |""".stripMargin)
+
+        checkNativeDppScan(df, Seq(Row(2, "b", 2)), "t_orc_dpp_fact", 1L, 1L)
+      }
+    }
+  }
+
+  test("iceberg native parquet scan reads top-level renamed columns by field id") {
+    withTable("local.db.t_rename") {
+      sql("create table local.db.t_rename (id int, old_name string) using iceberg")
+      sql("insert into local.db.t_rename values (1, 'before')")
+      sql("alter table local.db.t_rename rename column old_name to new_name")
+      sql("insert into local.db.t_rename values (2, 'after')")
+
+      val df = sql("select id, new_name from local.db.t_rename")
+      checkAnswer(df, Seq(Row(1, "before"), Row(2, "after")))
+      assert(df.queryExecution.executedPlan.toString().contains("NativeIcebergTableScan"))
+    }
+  }
+
+  test("iceberg native parquet scan does not reuse a dropped field id for an added column") {
+    withTable("local.db.t_drop_add") {
+      sql("create table local.db.t_drop_add (id int, value string) using iceberg")
+      sql("insert into local.db.t_drop_add values (1, 'old')")
+      sql("alter table local.db.t_drop_add drop column value")
+      sql("alter table local.db.t_drop_add add column value string")
+      sql("insert into local.db.t_drop_add values (2, 'new')")
+
+      val df = sql("select id, value from local.db.t_drop_add")
+      checkAnswer(df, Seq(Row(1, null), Row(2, "new")))
+      assert(df.queryExecution.executedPlan.toString().contains("NativeIcebergTableScan"))
+    }
+  }
+
+  test("iceberg ORC scan falls back after a top-level column rename") {
+    withTable("local.db.t_orc_rename") {
+      sql("""
+            |create table local.db.t_orc_rename (id int, old_name string)
+            |using iceberg
+            |tblproperties ('write.format.default' = 'orc')
+            |""".stripMargin)
+      sql("insert into local.db.t_orc_rename values (1, 'before')")
+      sql("alter table local.db.t_orc_rename rename column old_name to new_name")
+
+      val df = sql("select id, new_name from local.db.t_orc_rename")
+      checkAnswer(df, Seq(Row(1, "before")))
+      assert(!df.queryExecution.executedPlan.toString().contains("NativeIcebergTableScan"))
+    }
+  }
+
+  test("iceberg ORC scan falls back after top-level drop and add with the same name") {
+    withTable("local.db.t_orc_drop_add") {
+      sql("""
+            |create table local.db.t_orc_drop_add (id int, value string)
+            |using iceberg
+            |tblproperties ('write.format.default' = 'orc')
+            |""".stripMargin)
+      sql("insert into local.db.t_orc_drop_add values (1, 'old')")
+      sql("alter table local.db.t_orc_drop_add drop column value")
+      sql("alter table local.db.t_orc_drop_add add column value string")
+      sql("insert into local.db.t_orc_drop_add values (2, 'new')")
+
+      val df = sql("select id, value from local.db.t_orc_drop_add")
+      checkAnswer(df, Seq(Row(1, null), Row(2, "new")))
+      assert(!df.queryExecution.executedPlan.toString().contains("NativeIcebergTableScan"))
+    }
+  }
+
+  test("iceberg ORC scan remains native for additive schema evolution") {
+    withTable("local.db.t_orc_add") {
+      sql("""
+            |create table local.db.t_orc_add (id int)
+            |using iceberg
+            |tblproperties ('write.format.default' = 'orc')
+            |""".stripMargin)
+      sql("insert into local.db.t_orc_add values (1)")
+      sql("alter table local.db.t_orc_add add column value string")
+
+      val df = sql("select id, value from local.db.t_orc_add")
+      checkAnswer(df, Seq(Row(1, null)))
+      assert(df.queryExecution.executedPlan.toString().contains("NativeIcebergTableScan"))
+    }
+  }
+
+  test("iceberg scan falls back after a nested column rename") {
+    withTable("local.db.t_nested_rename") {
+      sql("""
+            |create table local.db.t_nested_rename (
+            |  id int,
+            |  payload struct<old_name:string>
+            |) using iceberg
+            |""".stripMargin)
+      sql("insert into local.db.t_nested_rename values (1, named_struct('old_name', 'before'))")
+      sql("alter table local.db.t_nested_rename rename column payload.old_name to new_name")
+
+      val df = sql("select id, payload.new_name from local.db.t_nested_rename")
+      checkAnswer(df, Seq(Row(1, "before")))
+      assert(!df.queryExecution.executedPlan.toString().contains("NativeIcebergTableScan"))
+    }
+  }
+
+  test("iceberg scan falls back when top-level and nested columns are both renamed") {
+    withTable("local.db.t_top_and_nested_rename") {
+      sql("""
+            |create table local.db.t_top_and_nested_rename (
+            |  old_id int,
+            |  payload struct<old_name:string>
+            |) using iceberg
+            |""".stripMargin)
+      sql("""insert into local.db.t_top_and_nested_rename
+          |values (1, named_struct('old_name', 'before'))
+          |""".stripMargin)
+      sql("alter table local.db.t_top_and_nested_rename rename column old_id to new_id")
+      sql("""
+            |alter table local.db.t_top_and_nested_rename
+            |rename column payload.old_name to new_name
+            |""".stripMargin)
+
+      val df =
+        sql("select new_id, payload.new_name from local.db.t_top_and_nested_rename")
+      checkAnswer(df, Seq(Row(1, "before")))
+      assert(!df.queryExecution.executedPlan.toString().contains("NativeIcebergTableScan"))
+    }
+  }
+
+  test("iceberg native scan is applied when delete files are null (format v1)") {
+    withTable("local.db.t_v1") {
+      sql("""
+            |create table local.db.t_v1 (id int, v string)
+            |using iceberg
+            |tblproperties ('format-version' = '1')
+            |""".stripMargin)
+      sql("insert into local.db.t_v1 values (1, 'a'), (2, 'b')")
+      val icebergTable = Spark3Util.loadIcebergTable(spark, "local.db.t_v1")
+      val scanTasks = icebergTable.newScan().planFiles()
+      val allDeletesEmpty =
+        try {
+          scanTasks
+            .iterator()
+            .asScala
+            .forall(task => task.deletes() == null || task.deletes().isEmpty)
+        } finally {
+          scanTasks.close()
+        }
+      assert(allDeletesEmpty)
+      val df = sql("select * from local.db.t_v1")
+      checkAnswer(df, Seq(Row(1, "a"), Row(2, "b")))
+      val plan = df.queryExecution.executedPlan.toString()
+      assert(plan.contains("NativeIcebergTableScan"))
+    }
+  }
+
+  test("iceberg scan pushes residual filters into native scan pruning predicates") {
+    withTable("local.db.t_residual") {
+      sql("create table local.db.t_residual (id int, v string) using iceberg")
+      sql("insert into local.db.t_residual values (1, 'a'), (2, 'b')")
+      val df = sql("select * from local.db.t_residual where id = 1")
+      checkAnswer(df, Seq(Row(1, "a")))
+      val nativeScanPlan = icebergScanPlan(df)
+      assert(nativeScanPlan.nonEmpty)
+      assert(nativeScanPlan.get.pruningPredicates.nonEmpty)
+      val plan = df.queryExecution.executedPlan.toString()
+      assert(plan.contains("NativeIcebergTableScan"))
+      assert(plan.contains("NativeFilter"))
+    }
+  }
+
+  test("iceberg scan pushes supported IN filters into native scan pruning predicates") {
+    withTable("local.db.t_residual_supported") {
+      sql("create table local.db.t_residual_supported (id int, v string) using iceberg")
+      sql(
+        "insert into local.db.t_residual_supported values (1, 'alpha'), (2, 'beta'), (3, 'atom')")
+      val df = sql("""
+          |select * from local.db.t_residual_supported
+          |where id in (1, 3)
+          |""".stripMargin)
+      checkAnswer(df, Seq(Row(1, "alpha"), Row(3, "atom")))
+      val nativeScanPlan = icebergScanPlan(df)
+      assert(nativeScanPlan.nonEmpty)
+      assert(nativeScanPlan.get.pruningPredicates.nonEmpty)
+      val plan = df.queryExecution.executedPlan.toString()
+      assert(plan.contains("NativeIcebergTableScan"))
+      assert(plan.contains("NativeFilter"))
+    }
+  }
+
+  test("iceberg scan pushes STARTS_WITH filters into native scan pruning predicates") {
+    withTable("local.db.t_residual_starts_with") {
+      sql("create table local.db.t_residual_starts_with (id int, v string) using iceberg")
+      sql("""
+          |insert into local.db.t_residual_starts_with
+          |values (1, 'alpha'), (2, 'beta'), (3, 'atom'), (4, null)
+          |""".stripMargin)
+      val df = sql("""
+          |select * from local.db.t_residual_starts_with
+          |where v like 'a%'
+          |""".stripMargin)
+      checkAnswer(df, Seq(Row(1, "alpha"), Row(3, "atom")))
+      val nativeScanPlan = icebergScanPlan(df)
+      assert(nativeScanPlan.nonEmpty)
+      val pruningPredicateText = nativeScanPlan.get.pruningPredicates.mkString("\n")
+      assert(
+        pruningPredicateText.contains("name: \"starts_with\"") &&
+          pruningPredicateText.contains("fun: StartsWith"),
+        pruningPredicateText)
+      val plan = df.queryExecution.executedPlan.toString()
+      assert(plan.contains("NativeIcebergTableScan"))
+      assert(plan.contains("NativeFilter"))
+    }
+  }
+
+  test("iceberg scan keeps native post-scan filter when only part of the predicate is pushed") {
+    withTable("local.db.t_residual_partial_pushdown") {
+      sql("create table local.db.t_residual_partial_pushdown (id int, v string) using iceberg")
+      sql(
+        "insert into local.db.t_residual_partial_pushdown values (1, 'alpha'), (2, 'beta'), (3, 'atom'), (4, 'delta')")
+      val df = sql("""
+          |select * from local.db.t_residual_partial_pushdown
+          |where id in (1, 2, 3) and id % 2 = 1
+          |""".stripMargin)
+      checkAnswer(df, Seq(Row(1, "alpha"), Row(3, "atom")))
+      val nativeScanPlan = icebergScanPlan(df)
+      assert(nativeScanPlan.nonEmpty)
+      assert(nativeScanPlan.get.pruningPredicates.nonEmpty)
+      val plan = df.queryExecution.executedPlan.toString()
+      assert(plan.contains("NativeIcebergTableScan"))
+      assert(plan.contains("NativeFilter"))
+    }
+  }
+
+  test("iceberg scan keeps native string filter outside scan pruning") {
+    withTable("local.db.t_residual_string") {
+      sql("create table local.db.t_residual_string (id int, v string) using iceberg")
+      sql("insert into local.db.t_residual_string values (1, 'a'), (2, 'b'), (3, null)")
+      val df = sql("""
+          |select * from local.db.t_residual_string
+          |where v = 'a'
+          |""".stripMargin)
+      checkAnswer(df, Seq(Row(1, "a")))
+      val nativeScanPlan = icebergScanPlan(df)
+      assert(nativeScanPlan.nonEmpty)
+      assert(nativeScanPlan.get.pruningPredicates.nonEmpty)
+      val plan = df.queryExecution.executedPlan.toString()
+      assert(plan.contains("NativeIcebergTableScan"))
+      assert(
+        plan.contains("NativeFilter"),
+        "string equality should remain on the post-scan native filter path")
+    }
+  }
+
+  test("iceberg native scan supports _file metadata column") {
+    withTable("local.db.t4") {
+      sql("create table local.db.t4 using iceberg as select 1 as id, 'a' as v")
+      checkSparkAnswerAndOperator("select _file from local.db.t4")
+    }
+  }
+
+  test("iceberg native scan supports _spec_id metadata column") {
+    withTable("local.db.t4_spec_id") {
+      sql("create table local.db.t4_spec_id using iceberg as select 1 as id, 'a' as v")
+      checkSparkAnswerAndOperator("select _spec_id from local.db.t4_spec_id")
+    }
+  }
+
+  Seq("parquet", "orc").foreach { format =>
+    test(s"iceberg native scan supports _partition on unpartitioned tables: $format") {
+      withTable("local.db.t_partition_metadata") {
+        sql(s"""CREATE TABLE local.db.t_partition_metadata (id INT) USING iceberg
+            |TBLPROPERTIES ('write.format.default' = '$format')""".stripMargin)
+        checkSparkAnswerAndOperator("SELECT id, _partition FROM local.db.t_partition_metadata")
+        sql("INSERT INTO local.db.t_partition_metadata VALUES (1), (2)")
+        withSQLConf("spark.sql.adaptive.enabled" -> "true") {
+          val df =
+            checkSparkAnswerAndOperator(
+              "SELECT id, _partition FROM local.db.t_partition_metadata")
+          // The helper collects once; this second action must also work with AQE.
+          checkAnswer(df, Seq(Row(1, null), Row(2, null)))
+        }
+        checkSparkAnswerAndOperator("SELECT _partition FROM local.db.t_partition_metadata")
+      }
+    }
+
+    test(s"iceberg native scan supports _partition values and field projections: $format") {
+      withTable("local.db.t_partition_metadata") {
+        sql(s"""CREATE TABLE local.db.t_partition_metadata
+            |(id INT, p STRING, ts TIMESTAMP, d DATE, amount DECIMAL(8, 2)) USING iceberg
+            |PARTITIONED BY (p, bucket(4, id), days(ts), d, amount)
+            |TBLPROPERTIES ('write.format.default' = '$format')""".stripMargin)
+        sql("""INSERT INTO local.db.t_partition_metadata VALUES
+            |(1, 'east', TIMESTAMP '2026-01-01 12:00:00', DATE '2026-01-01', 12.34),
+            |(2, 'west', TIMESTAMP '2026-01-02 12:00:00', DATE '2026-01-02', 56.78),
+            |(3, NULL, NULL, NULL, NULL)""".stripMargin)
+
+        checkSparkAnswerAndOperator("SELECT _partition FROM local.db.t_partition_metadata")
+        checkSparkAnswerAndOperator("SELECT id, _partition FROM local.db.t_partition_metadata")
+        checkSparkAnswerAndOperator(
+          "SELECT _partition, _file, p, id, _spec_id FROM local.db.t_partition_metadata")
+        checkSparkAnswerAndOperator(
+          "SELECT _partition.p, _partition.id_bucket, _partition.ts_day, " +
+            "_partition.d, _partition.amount FROM local.db.t_partition_metadata")
+        val df = checkSparkAnswerAndOperator(
+          "SELECT id, _partition.p FROM local.db.t_partition_metadata")
+        checkAnswer(df, Seq(Row(1, "east"), Row(2, "west"), Row(3, null)))
+      }
+    }
+
+    test(s"iceberg native scan supports _partition across partition specs: $format") {
+      withTable("local.db.t_partition_metadata") {
+        sql(s"""CREATE TABLE local.db.t_partition_metadata
+            |(id INT, p STRING, ts TIMESTAMP) USING iceberg
+            |PARTITIONED BY (p, bucket(4, id))
+            |TBLPROPERTIES ('format-version' = '2', 'write.format.default' = '$format')
+            |""".stripMargin)
+        sql("""INSERT INTO local.db.t_partition_metadata VALUES
+            |(1, 'east', TIMESTAMP '2026-01-01 12:00:00'), (2, NULL, NULL)""".stripMargin)
+        sql("ALTER TABLE local.db.t_partition_metadata DROP PARTITION FIELD p")
+        sql("ALTER TABLE local.db.t_partition_metadata ADD PARTITION FIELD days(ts)")
+        sql("""INSERT INTO local.db.t_partition_metadata VALUES
+            |(3, 'west', TIMESTAMP '2026-01-03 12:00:00'), (4, NULL, NULL)""".stripMargin)
+
+        val df = checkSparkAnswerAndOperator(
+          "SELECT id, _partition, _spec_id FROM local.db.t_partition_metadata")
+        assert(df.collect().map(_.getInt(2)).distinct.length == 2)
+        checkSparkAnswerAndOperator("SELECT _partition FROM local.db.t_partition_metadata")
+        val fields = checkSparkAnswerAndOperator(
+          "SELECT id, _partition.p, _partition.ts_day FROM local.db.t_partition_metadata")
+        val rows = fields.collect().map(row => row.getInt(0) -> row).toMap
+        assert(rows(1).getString(1) == "east" && rows(1).isNullAt(2))
+        assert(rows(3).isNullAt(1) && !rows(3).isNullAt(2))
+        assert(rows(2).isNullAt(1) && rows(2).isNullAt(2))
+        assert(rows(4).isNullAt(1) && rows(4).isNullAt(2))
+      }
+    }
+  }
+
+  test("iceberg _partition scan falls back for unsupported partition types") {
+    withTable("local.db.t_partition_metadata") {
+      sql("""CREATE TABLE local.db.t_partition_metadata (id INT, p DECIMAL(20, 2))
+          |USING iceberg PARTITIONED BY (p)""".stripMargin)
+      sql("INSERT INTO local.db.t_partition_metadata VALUES (1, 12.34)")
+      val query = "SELECT _partition FROM local.db.t_partition_metadata"
+      var expected: Seq[Row] = Nil
+      withSQLConf("spark.auron.enabled" -> "false") {
+        expected = sql(query).collect().toSeq
+      }
+      withSQLConf("spark.auron.enabled" -> "true", "spark.auron.enable.iceberg.scan" -> "true") {
+        val df = sql(query)
+        checkAnswer(df, expected)
+        assert(!df.queryExecution.executedPlan.toString().contains("NativeIcebergTableScan"))
+      }
+    }
+  }
+
+  test("iceberg _partition scan falls back for row metadata and changelog tasks") {
+    withTable("local.db.t_partition_metadata") {
+      sql(
+        "CREATE TABLE local.db.t_partition_metadata (id INT, p STRING) " +
+          "USING iceberg PARTITIONED BY (p)")
+      sql("INSERT INTO local.db.t_partition_metadata VALUES (1, 'east')")
+      Seq(
+        "SELECT id, _partition, _pos FROM local.db.t_partition_metadata",
+        "SELECT id, _partition FROM local.db.t_partition_metadata.changes").foreach { query =>
+        var expected: Seq[Row] = Nil
+        withSQLConf("spark.auron.enabled" -> "false") {
+          expected = sql(query).collect().toSeq
+        }
+        withSQLConf(
+          "spark.auron.enabled" -> "true",
+          "spark.auron.enable.iceberg.scan" -> "true") {
+          val df = sql(query)
+          checkAnswer(df, expected)
+          assert(!df.queryExecution.executedPlan.toString().contains("NativeIcebergTableScan"))
+        }
+      }
+    }
+  }
+
+  test("iceberg native scan supports data columns with _file and _spec_id metadata columns") {
+    withTable("local.db.t4_metadata_mixed") {
+      sql("create table local.db.t4_metadata_mixed using iceberg as select 1 as id, 'a' as v")
+      checkSparkAnswerAndOperator("select id, _file, _spec_id from local.db.t4_metadata_mixed")
+    }
+  }
+
+  test("iceberg native scan supports data columns with _file metadata column") {
+    withTable("local.db.t4_mixed") {
+      sql("create table local.db.t4_mixed using iceberg as select 1 as id, 'a' as v")
+      checkSparkAnswerAndOperator("select id, _file from local.db.t4_mixed")
+    }
+  }
+
+  test("iceberg native scan preserves projected order for _file metadata column") {
+    withTable("local.db.t4_metadata_first") {
+      sql("create table local.db.t4_metadata_first using iceberg as select 1 as id, 'a' as v")
+      checkSparkAnswerAndOperator("select _file, id from local.db.t4_metadata_first")
+    }
+  }
+
+  test("iceberg native scan supports insert-only changelog scan") {
+    withTable("local.db.t_changelog_insert") {
+      withTempView("t_changelog_insert_changes") {
+        sql("""
+              |create table local.db.t_changelog_insert (id int, v string)
+              |using iceberg
+              |tblproperties ('format-version' = '2')
+              |""".stripMargin)
+        sql("insert into local.db.t_changelog_insert values (1, 'a')")
+        val startSnapshotId = currentSnapshotId("local.db.t_changelog_insert")
+        sql("insert into local.db.t_changelog_insert values (2, 'b'), (3, 'c')")
+        val endSnapshotId = currentSnapshotId("local.db.t_changelog_insert")
+        createChangelogView(
+          "local.db.t_changelog_insert",
+          "t_changelog_insert_changes",
+          startSnapshotId,
+          endSnapshotId)
+
+        val df = checkSparkAnswerAndOperator("""
+            |select id, v, _change_type, _change_ordinal, _commit_snapshot_id
+            |from t_changelog_insert_changes
+            |order by id
+            |""".stripMargin)
+        val nativeScanPlan = icebergScanPlan(df)
+        assert(nativeScanPlan.nonEmpty)
+        assert(
+          nativeScanPlan.get.partitionSchema.fieldNames
+            .contains(MetadataColumns.CHANGE_TYPE.name()))
+      }
+    }
+  }
+
+  test("iceberg native changelog scan prunes direct scan tasks by metadata predicates") {
+    withTable("local.db.t_changelog_direct_pruning") {
+      sql("""
+            |create table local.db.t_changelog_direct_pruning (id int, v string)
+            |using iceberg
+            |tblproperties ('format-version' = '2')
+            |""".stripMargin)
+      sql("insert into local.db.t_changelog_direct_pruning values (0, 'seed')")
+      val startSnapshotId = currentSnapshotId("local.db.t_changelog_direct_pruning")
+      sql("insert into local.db.t_changelog_direct_pruning values (1, 'a')")
+      val firstSnapshotId = currentSnapshotId("local.db.t_changelog_direct_pruning")
+      sql("insert into local.db.t_changelog_direct_pruning values (2, 'b')")
+      val secondSnapshotId = currentSnapshotId("local.db.t_changelog_direct_pruning")
+      sql("insert into local.db.t_changelog_direct_pruning values (3, 'c')")
+      val endSnapshotId = currentSnapshotId("local.db.t_changelog_direct_pruning")
+
+      def checkPlan(
+          condition: Map[
+            String,
+            Attribute] => org.apache.spark.sql.catalyst.expressions.Expression,
+          expectedTaskCount: Int): Unit = {
+        val scan =
+          rawChangelogScan("local.db.t_changelog_direct_pruning", startSnapshotId, endSnapshotId)
+        val attributes = scan.output.map(attribute => attribute.name -> attribute).toMap
+        new IcebergConvertProvider().prepare(FilterExec(condition(attributes), scan))
+        assert(IcebergScanSupport.plan(scan).get.scanTasks.size == expectedTaskCount)
+      }
+
+      checkPlan(
+        attributes => EqualTo(attributes("_commit_snapshot_id"), Literal(secondSnapshotId)),
+        expectedTaskCount = 1)
+      checkPlan(
+        attributes => EqualTo(attributes("_commit_snapshot_id"), Literal(-1L)),
+        expectedTaskCount = 0)
+      checkPlan(
+        attributes => In(attributes("_change_ordinal"), Seq(Literal(0), Literal(2))),
+        expectedTaskCount = 2)
+      checkPlan(
+        attributes =>
+          And(
+            EqualTo(attributes("_change_type"), Literal("INSERT")),
+            EqualTo(attributes("_commit_snapshot_id"), Literal(firstSnapshotId))),
+        expectedTaskCount = 1)
+      checkPlan(
+        attributes =>
+          Or(
+            EqualTo(attributes("_commit_snapshot_id"), Literal(firstSnapshotId)),
+            EqualTo(attributes("_commit_snapshot_id"), Literal(secondSnapshotId))),
+        expectedTaskCount = 3)
+      checkPlan(
+        attributes => Not(EqualTo(attributes("_commit_snapshot_id"), Literal(firstSnapshotId))),
+        expectedTaskCount = 3)
+      checkPlan(
+        attributes =>
+          And(
+            EqualTo(attributes("_commit_snapshot_id"), Literal(secondSnapshotId)),
+            EqualTo(attributes("id"), Literal(2))),
+        expectedTaskCount = 1)
+      checkPlan(
+        attributes =>
+          EqualTo(attributes("_commit_snapshot_id").newInstance(), Literal(secondSnapshotId)),
+        expectedTaskCount = 3)
+      checkPlan(
+        attributes =>
+          And(
+            EqualTo(attributes("id"), Literal(2)),
+            EqualTo(attributes("_commit_snapshot_id"), Literal(secondSnapshotId))),
+        expectedTaskCount = 1)
+      checkPlan(
+        attributes =>
+          And(
+            EqualTo(attributes("_commit_snapshot_id").newInstance(), Literal(secondSnapshotId)),
+            EqualTo(attributes("id"), Literal(2))),
+        expectedTaskCount = 3)
+      checkPlan(
+        attributes =>
+          And(
+            EqualTo(attributes("_commit_snapshot_id"), Literal(secondSnapshotId)),
+            EqualTo(attributes("_commit_snapshot_id").newInstance(), Literal(-1L))),
+        expectedTaskCount = 1)
+      checkPlan(
+        attributes =>
+          And(
+            GreaterThan(Rand(Literal(0L)), Literal(0.5)),
+            EqualTo(attributes("_commit_snapshot_id"), Literal(secondSnapshotId))),
+        expectedTaskCount = 3)
+
+      val projectedScan =
+        rawChangelogScan("local.db.t_changelog_direct_pruning", startSnapshotId, endSnapshotId)
+      val projectedId =
+        Alias(Add(projectedScan.output.find(_.name == "id").get, Literal(1)), "next_id")()
+      val project = ProjectExec(projectedScan.output :+ projectedId, projectedScan)
+      val condition = And(
+        EqualTo(
+          projectedScan.output.find(_.name == "_commit_snapshot_id").get,
+          Literal(secondSnapshotId)),
+        EqualTo(projectedId.toAttribute, Literal(3)))
+      new IcebergConvertProvider().prepare(FilterExec(condition, project))
+      assert(IcebergScanSupport.plan(projectedScan).get.scanTasks.size == 1)
+
+      withSQLConf("spark.auron.enabled" -> "true", "spark.auron.enable.iceberg.scan" -> "true") {
+        val scan =
+          rawChangelogScan("local.db.t_changelog_direct_pruning", startSnapshotId, endSnapshotId)
+        val commitSnapshotId = scan.output.find(_.name == "_commit_snapshot_id").get
+        val transformed = AuronColumnarOverrides(spark).preColumnarTransitions.apply(
+          FilterExec(EqualTo(commitSnapshotId, Literal(secondSnapshotId)), scan))
+        val nativeScan = transformed.collectFirst { case nativeScan: NativeIcebergTableScanExec =>
+          nativeScan
+        }.get
+        assert(nativeScan.staticPlan.scanTasks.size == 1)
+      }
+    }
+  }
+
+  test("iceberg changelog metadata pruning does not cross unsafe operators") {
+    withTable("local.db.t_changelog_snapshot_pruning") {
+      withTempView("t_changelog_snapshot_pruning_changes") {
+        sql("""
+              |create table local.db.t_changelog_snapshot_pruning (id int, v string)
+              |using iceberg
+              |tblproperties ('format-version' = '2')
+              |""".stripMargin)
+        sql("insert into local.db.t_changelog_snapshot_pruning values (0, 'seed')")
+        val startSnapshotId = currentSnapshotId("local.db.t_changelog_snapshot_pruning")
+        sql("insert into local.db.t_changelog_snapshot_pruning values (1, 'a')")
+        sql("insert into local.db.t_changelog_snapshot_pruning values (2, 'b')")
+        sql("insert into local.db.t_changelog_snapshot_pruning values (3, 'c')")
+        val endSnapshotId = currentSnapshotId("local.db.t_changelog_snapshot_pruning")
+        createChangelogView(
+          "local.db.t_changelog_snapshot_pruning",
+          "t_changelog_snapshot_pruning_changes",
+          startSnapshotId,
+          endSnapshotId)
+
+        def checkQuery(query: String, expected: Seq[Row], expectedTaskCount: Int): Unit = {
+          withSQLConf("spark.auron.enabled" -> "false") {
+            checkAnswer(sql(query), expected)
+          }
+          withSQLConf(
+            "spark.auron.enabled" -> "true",
+            "spark.auron.enable.iceberg.scan" -> "true") {
+            if (expectedTaskCount > 0) {
+              val df = sql(query)
+              checkAnswer(df, expected)
+              val nativeScan = executedNativeIcebergTableScanExec(df)
+              assert(nativeScan.metrics("numFiles").value == expectedTaskCount)
+            } else {
+              val zeroFilesReported = new CountDownLatch(1)
+              val listener = new SparkListener {
+                override def onOtherEvent(event: SparkListenerEvent): Unit = event match {
+                  case SparkListenerDriverAccumUpdates(_, updates)
+                      if updates.size == 2 && updates.forall(_._2 == 0L) =>
+                    zeroFilesReported.countDown()
+                  case _ =>
+                }
+              }
+              spark.sparkContext.addSparkListener(listener)
+              try {
+                checkAnswer(sql(query), expected)
+                assert(zeroFilesReported.await(30, TimeUnit.SECONDS))
+              } finally {
+                spark.sparkContext.removeSparkListener(listener)
+              }
+            }
+          }
+        }
+
+        checkQuery(
+          """
+            |select _change_ordinal
+            |from (
+            |  select max(_change_ordinal) as _change_ordinal
+            |  from t_changelog_snapshot_pruning_changes
+            |)
+            |where _change_ordinal = 0
+            |""".stripMargin,
+          Seq.empty,
+          expectedTaskCount = 3)
+        checkQuery(
+          """
+            |select _change_ordinal
+            |from (
+            |  select _change_ordinal
+            |  from t_changelog_snapshot_pruning_changes
+            |  order by _change_ordinal
+            |  limit 1
+            |)
+            |where _change_ordinal = 0
+            |""".stripMargin,
+          Seq(Row(0)),
+          expectedTaskCount = 3)
+        val nondeterministicDf = sql("""
+            |select _change_ordinal, random_value
+            |from (
+            |  select _change_ordinal, rand() as random_value
+            |  from t_changelog_snapshot_pruning_changes
+            |)
+            |where _change_ordinal = 0
+            |""".stripMargin)
+        assert(nondeterministicDf.collect().map(_.getInt(0)).toSeq == Seq(0))
+        assert(
+          executedNativeIcebergTableScanExec(nondeterministicDf).staticPlan.scanTasks.size == 3)
+      }
+    }
+  }
+
+  test("iceberg native scan supports full-data-file delete changelog scan") {
+    withTable("local.db.t_changelog_full_file_delete") {
+      withTempView("t_changelog_full_file_delete_changes") {
+        sql("""
+              |create table local.db.t_changelog_full_file_delete (id int, v string, p int)
+              |using iceberg
+              |partitioned by (p)
+              |tblproperties ('format-version' = '2')
+              |""".stripMargin)
+        sql("""
+              |insert into local.db.t_changelog_full_file_delete
+              |values (1, 'a', 1), (2, 'b', 2)
+              |""".stripMargin)
+        val startSnapshotId = currentSnapshotId("local.db.t_changelog_full_file_delete")
+        sql("delete from local.db.t_changelog_full_file_delete where p = 1")
+        val endSnapshotId = currentSnapshotId("local.db.t_changelog_full_file_delete")
+        createChangelogView(
+          "local.db.t_changelog_full_file_delete",
+          "t_changelog_full_file_delete_changes",
+          startSnapshotId,
+          endSnapshotId)
+
+        val query =
+          """
+            |select id, v, p, _change_type
+            |from t_changelog_full_file_delete_changes
+            |order by id
+            |""".stripMargin
+        val expected = Seq(Row(1, "a", 1, "DELETE"))
+        withSQLConf("spark.auron.enabled" -> "false") {
+          checkAnswer(sql(query), expected)
+        }
+        withSQLConf(
+          "spark.auron.enabled" -> "true",
+          "spark.auron.enable.iceberg.scan" -> "true") {
+          val df = sql(query)
+          checkAnswer(df, expected)
+          val nativeScan = executedNativeIcebergTableScanExec(df)
+          assert(nativeScan.staticPlan.scanTasks.size == 1)
+        }
+
+        val metadataFilterQuery = """
+            |select id
+            |from t_changelog_full_file_delete_changes
+            |where _change_type = 'INSERT'
+            |""".stripMargin
+        withSQLConf("spark.auron.enabled" -> "false") {
+          checkAnswer(sql(metadataFilterQuery), Seq.empty)
+        }
+        withSQLConf(
+          "spark.auron.enabled" -> "true",
+          "spark.auron.enable.iceberg.scan" -> "true") {
+          val df = sql(metadataFilterQuery)
+          checkAnswer(df, Seq.empty)
+          // The changelog view's row processing prevents pushing this filter down to the scan.
+          assert(executedNativeIcebergTableScanExec(df).metrics("numFiles").value == 1L)
+        }
+      }
+    }
+  }
+
+  test(
+    "iceberg native changelog scan prunes full-data-file delete tasks by metadata predicates") {
+    val tableName = "local.db.t_changelog_delete_pruning"
+    withTable(tableName) {
+      sql(s"""
+             |create table $tableName (id int, p int)
+             |using iceberg
+             |partitioned by (p)
+             |tblproperties ('format-version' = '2')
+             |""".stripMargin)
+      sql(s"insert into $tableName values (1, 1), (2, 2)")
+      val startSnapshotId = currentSnapshotId(tableName)
+      sql(s"delete from $tableName where p = 1")
+      val firstDeleteSnapshotId = currentSnapshotId(tableName)
+      sql(s"insert into $tableName values (3, 3), (4, 3)")
+      val insertSnapshotId = currentSnapshotId(tableName)
+      sql(s"delete from $tableName where p = 2")
+      val endSnapshotId = currentSnapshotId(tableName)
+
+      val scan = rawChangelogScan(tableName, startSnapshotId, endSnapshotId)
+      val tasks = scan.scan.toBatch.planInputPartitions().toSeq.flatMap(icebergScanTasks)
+      assert(tasks.size == 3)
+      assert(tasks.count(_.isInstanceOf[AddedRowsScanTask]) == 1)
+      val deleteTasks = tasks.collect { case task: DeletedDataFileScanTask => task }
+      assert(deleteTasks.size == 2)
+      assert(deleteTasks.forall(_.existingDeletes().isEmpty))
+
+      val firstDelete = Row(1, 1, "DELETE", 0, firstDeleteSnapshotId)
+      val insert = Row(3, 3, "INSERT", 1, insertSnapshotId)
+      val otherInsert = Row(4, 3, "INSERT", 1, insertSnapshotId)
+      val secondDelete = Row(2, 2, "DELETE", 2, endSnapshotId)
+      val cases: Seq[(Map[String, Attribute] => Expression, Seq[Row], Int)] = Seq(
+        (
+          attributes => EqualTo(attributes("_change_type"), Literal("DELETE")),
+          Seq(firstDelete, secondDelete),
+          2),
+        (
+          attributes => EqualTo(attributes("_change_type"), Literal("INSERT")),
+          Seq(insert, otherInsert),
+          1),
+        (
+          attributes => EqualTo(attributes("_commit_snapshot_id"), Literal(endSnapshotId)),
+          Seq(secondDelete),
+          1),
+        (
+          attributes =>
+            In(
+              attributes("_commit_snapshot_id"),
+              Seq(Literal(firstDeleteSnapshotId), Literal(insertSnapshotId))),
+          Seq(firstDelete, insert, otherInsert),
+          2),
+        (attributes => EqualTo(attributes("_change_ordinal"), Literal(0)), Seq(firstDelete), 1),
+        (
+          attributes => In(attributes("_change_ordinal"), Seq(Literal(1), Literal(2))),
+          Seq(insert, otherInsert, secondDelete),
+          2),
+        (
+          attributes =>
+            And(
+              EqualTo(attributes("_change_type"), Literal("DELETE")),
+              EqualTo(attributes("_commit_snapshot_id"), Literal(firstDeleteSnapshotId))),
+          Seq(firstDelete),
+          1),
+        (
+          attributes => EqualTo(attributes("_commit_snapshot_id"), Literal(startSnapshotId)),
+          Seq.empty,
+          0),
+        (
+          attributes =>
+            And(
+              EqualTo(attributes("_change_type"), Literal("INSERT")),
+              EqualTo(attributes("_change_ordinal"), Literal(0))),
+          Seq.empty,
+          0),
+        (
+          attributes =>
+            And(
+              EqualTo(attributes("_change_type"), Literal("INSERT")),
+              EqualTo(attributes("id"), Literal(3))),
+          Seq(insert),
+          1),
+        (
+          attributes =>
+            And(
+              EqualTo(attributes("_change_type"), Literal("DELETE")),
+              GreaterThan(attributes("id"), Literal(1))),
+          Seq(secondDelete),
+          2),
+        (
+          attributes =>
+            And(
+              And(
+                In(
+                  attributes("_commit_snapshot_id"),
+                  Seq(Literal(firstDeleteSnapshotId), Literal(insertSnapshotId))),
+                EqualTo(attributes("id"), Literal(3))),
+              EqualTo(attributes("_change_type"), Literal("INSERT"))),
+          Seq(insert),
+          1),
+        (
+          attributes =>
+            And(
+              EqualTo(attributes("_change_type"), Literal("INSERT")),
+              And(
+                EqualTo(attributes("_change_ordinal"), Literal(0)),
+                EqualTo(attributes("id"), Literal(3)))),
+          Seq.empty,
+          0),
+        (
+          attributes =>
+            And(
+              EqualTo(attributes("_change_type"), Literal("INSERT")),
+              EqualTo(attributes("id"), Literal(-1))),
+          Seq.empty,
+          1),
+        (
+          attributes =>
+            And(
+              EqualTo(attributes("_change_type"), Literal("INSERT")),
+              Or(EqualTo(attributes("id"), Literal(3)), EqualTo(attributes("id"), Literal(4)))),
+          Seq(insert, otherInsert),
+          1),
+        (
+          attributes =>
+            And(
+              EqualTo(attributes("_change_type"), Literal("INSERT")),
+              Not(EqualTo(attributes("id"), Literal(4)))),
+          Seq(insert),
+          1),
+        (
+          attributes =>
+            Or(
+              And(
+                EqualTo(attributes("_change_type"), Literal("INSERT")),
+                EqualTo(attributes("id"), Literal(3))),
+              EqualTo(attributes("_change_type"), Literal("DELETE"))),
+          Seq(firstDelete, insert, secondDelete),
+          3),
+        (
+          attributes =>
+            Not(
+              And(
+                EqualTo(attributes("_change_type"), Literal("INSERT")),
+                EqualTo(attributes("id"), Literal(3)))),
+          Seq(firstDelete, otherInsert, secondDelete),
+          3),
+        (attributes => EqualTo(attributes("id"), Literal(3)), Seq(insert), 3))
+
+      cases.foreach { case (condition, expected, expectedTaskCount) =>
+        def filteredScan: FilterExec = {
+          val scan = rawChangelogScan(tableName, startSnapshotId, endSnapshotId)
+          FilterExec(
+            condition(scan.output.map(attribute => attribute.name -> attribute).toMap),
+            scan)
+        }
+
+        def checkRows(plan: SparkPlan): Unit = {
+          val schema = plan.schema
+          val rows = plan
+            .execute()
+            .mapPartitions { rows =>
+              val toScala = CatalystTypeConverters.createToScalaConverter(schema)
+              rows.map(row => toScala(row).asInstanceOf[Row])
+            }
+            .collect()
+            .toSeq
+          assert(rows.sortBy(_.getInt(0)) == expected.sortBy(_.getInt(0)), plan.treeString)
+        }
+
+        withSQLConf("spark.auron.enabled" -> "false") {
+          checkRows(filteredScan)
+        }
+        withSQLConf(
+          "spark.auron.enabled" -> "true",
+          "spark.auron.enable.iceberg.scan" -> "true") {
+          val transformed =
+            AuronColumnarOverrides(spark).preColumnarTransitions.apply(filteredScan)
+          val nativeScan = transformed.collectFirst { case native: NativeIcebergTableScanExec =>
+            native
+          }.get
+          assert(nativeScan.staticPlan.scanTasks.size == expectedTaskCount)
+          checkRows(transformed)
+          assert(nativeScan.metrics("numFiles").value == expectedTaskCount)
+        }
+      }
+    }
+  }
+
+  test("iceberg native changelog scan remains correct in dynamic pruning join") {
+    withTable("local.db.t_changelog_dpp", "local.db.t_changelog_dpp_dim") {
+      withTempView("t_changelog_dpp_changes") {
+        sql("""
+              |create table local.db.t_changelog_dpp (id int, v string, p int)
+              |using iceberg
+              |partitioned by (p)
+              |tblproperties ('format-version' = '2')
+              |""".stripMargin)
+        sql("insert into local.db.t_changelog_dpp values (0, 'seed', 0)")
+        val startSnapshotId = currentSnapshotId("local.db.t_changelog_dpp")
+        sql("""
+              |insert into local.db.t_changelog_dpp
+              |values (1, 'a', 1), (2, 'b', 2), (3, 'c', 3)
+              |""".stripMargin)
+        val endSnapshotId = currentSnapshotId("local.db.t_changelog_dpp")
+        createChangelogView(
+          "local.db.t_changelog_dpp",
+          "t_changelog_dpp_changes",
+          startSnapshotId,
+          endSnapshotId)
+        sql("create table local.db.t_changelog_dpp_dim using iceberg as select 1 as id, 2 as p")
+
+        withSQLConf(
+          "spark.auron.enabled" -> "true",
+          "spark.auron.enable.iceberg.scan" -> "true",
+          "spark.sql.optimizer.dynamicPartitionPruning.enabled" -> "true",
+          "spark.sql.optimizer.dynamicPartitionPruning.reuseBroadcastOnly" -> "true",
+          "spark.sql.autoBroadcastJoinThreshold" -> "1024") {
+          val df = sql("""
+              |select /*+ BROADCAST(d) */ c.id, c.v, c.p, c._change_type
+              |from t_changelog_dpp_changes c
+              |join local.db.t_changelog_dpp_dim d
+              |on c.p = d.p
+              |where d.id = 1
+              |""".stripMargin)
+
+          checkAnswer(df, Seq(Row(2, "b", 2, "INSERT")))
+          executedNativeIcebergTableScanExec(df)
+        }
+      }
+    }
+  }
+
+  test("iceberg changelog task filter survives a runtime-filter scan copy") {
+    withTable("local.db.t_changelog_runtime_filter_copy") {
+      sql("""
+            |create table local.db.t_changelog_runtime_filter_copy (id int, v string, p int)
+            |using iceberg
+            |partitioned by (p)
+            |tblproperties ('format-version' = '2')
+            |""".stripMargin)
+      sql("insert into local.db.t_changelog_runtime_filter_copy values (0, 'seed', 0)")
+      val startSnapshotId = currentSnapshotId("local.db.t_changelog_runtime_filter_copy")
+      sql("insert into local.db.t_changelog_runtime_filter_copy values (1, 'a', 1)")
+      sql("insert into local.db.t_changelog_runtime_filter_copy values (2, 'b', 2)")
+      sql("insert into local.db.t_changelog_runtime_filter_copy values (3, 'c', 3)")
+      val endSnapshotId = currentSnapshotId("local.db.t_changelog_runtime_filter_copy")
+      val scan = rawChangelogScan(
+        "local.db.t_changelog_runtime_filter_copy",
+        startSnapshotId,
+        endSnapshotId)
+      val changeOrdinal = scan.output.find(_.name == "_change_ordinal").get
+      val id = scan.output.find(_.name == "id").get
+      new IcebergConvertProvider().prepare(
+        FilterExec(And(EqualTo(changeOrdinal, Literal(1)), EqualTo(id, Literal(2))), scan))
+
+      val copied = IcebergScanSupport.withRuntimeFilters(scan, Seq(Literal(true)))
+      assert(copied.runtimeFilters.nonEmpty)
+      assert(IcebergScanSupport.plan(copied).get.scanTasks.size == 1)
+    }
+  }
+
+  test("iceberg changelog scan reads renamed columns by field id") {
+    withTable("local.db.t_changelog_rename") {
+      withTempView("t_changelog_rename_changes") {
+        sql("""
+              |create table local.db.t_changelog_rename (id int, old_name string)
+              |using iceberg
+              |tblproperties ('format-version' = '2')
+              |""".stripMargin)
+        sql("insert into local.db.t_changelog_rename values (0, 'initial')")
+        val startSnapshotId = currentSnapshotId("local.db.t_changelog_rename")
+        sql("insert into local.db.t_changelog_rename values (1, 'before')")
+        sql("alter table local.db.t_changelog_rename rename column old_name to new_name")
+        sql("insert into local.db.t_changelog_rename values (2, 'after')")
+        val endSnapshotId = currentSnapshotId("local.db.t_changelog_rename")
+        createChangelogView(
+          "local.db.t_changelog_rename",
+          "t_changelog_rename_changes",
+          startSnapshotId,
+          endSnapshotId)
+
+        checkSparkAnswerAndOperator("""
+            |select id, new_name, _change_type, _change_ordinal, _commit_snapshot_id
+            |from t_changelog_rename_changes
+            |order by id
+            |""".stripMargin)
+      }
+    }
+  }
+
+  test("iceberg changelog scan does not reuse dropped field id for an added column") {
+    withTable("local.db.t_changelog_drop_add") {
+      withTempView("t_changelog_drop_add_changes") {
+        sql("""
+              |create table local.db.t_changelog_drop_add (id int, value string)
+              |using iceberg
+              |tblproperties ('format-version' = '2')
+              |""".stripMargin)
+        sql("insert into local.db.t_changelog_drop_add values (0, 'initial')")
+        val startSnapshotId = currentSnapshotId("local.db.t_changelog_drop_add")
+        sql("insert into local.db.t_changelog_drop_add values (1, 'old')")
+        sql("alter table local.db.t_changelog_drop_add drop column value")
+        sql("alter table local.db.t_changelog_drop_add add column value string")
+        sql("insert into local.db.t_changelog_drop_add values (2, 'new')")
+        val endSnapshotId = currentSnapshotId("local.db.t_changelog_drop_add")
+        createChangelogView(
+          "local.db.t_changelog_drop_add",
+          "t_changelog_drop_add_changes",
+          startSnapshotId,
+          endSnapshotId)
+
+        checkSparkAnswerAndOperator("""
+            |select id, value, _change_type, _change_ordinal, _commit_snapshot_id
+            |from t_changelog_drop_add_changes
+            |order by id
+            |""".stripMargin)
+      }
+    }
+  }
+
+  test("iceberg native scan supports mixed insert and full-data-file delete changelog scan") {
+    withTable("local.db.t_changelog_mixed_delete") {
+      withTempView("t_changelog_mixed_delete_changes") {
+        sql("""
+              |create table local.db.t_changelog_mixed_delete (id int, v string, p int)
+              |using iceberg
+              |partitioned by (p)
+              |tblproperties ('format-version' = '2')
+              |""".stripMargin)
+        sql("""
+              |insert into local.db.t_changelog_mixed_delete
+              |values (1, 'a', 1), (2, 'b', 2)
+              |""".stripMargin)
+        val startSnapshotId = currentSnapshotId("local.db.t_changelog_mixed_delete")
+        sql("delete from local.db.t_changelog_mixed_delete where p = 1")
+        sql("insert into local.db.t_changelog_mixed_delete values (3, 'c', 3)")
+        val endSnapshotId = currentSnapshotId("local.db.t_changelog_mixed_delete")
+        createChangelogView(
+          "local.db.t_changelog_mixed_delete",
+          "t_changelog_mixed_delete_changes",
+          startSnapshotId,
+          endSnapshotId)
+
+        val query =
+          """
+            |select id, v, p, _change_type, _change_ordinal, _commit_snapshot_id
+            |from t_changelog_mixed_delete_changes
+            |order by id, _change_type
+            |""".stripMargin
+        var expected: Seq[Row] = Nil
+        withSQLConf("spark.auron.enabled" -> "false") {
+          expected = sql(query).collect().toSeq
+        }
+        assert(expected.exists(row => row.getString(3) == "DELETE"))
+        assert(expected.exists(row => row.getString(3) == "INSERT"))
+        withSQLConf(
+          "spark.auron.enabled" -> "true",
+          "spark.auron.enable.iceberg.scan" -> "true") {
+          val df = sql(query)
+          checkAnswer(df, expected)
+          executedNativeIcebergTableScanExec(df)
+        }
+      }
+    }
+  }
+
+  test("iceberg changelog scan falls back for mixed file formats") {
+    withTable("local.db.t_changelog_mixed_formats") {
+      withTempView("t_changelog_mixed_formats_changes") {
+        sql("""
+              |create table local.db.t_changelog_mixed_formats (id int, v string)
+              |using iceberg
+              |tblproperties ('format-version' = '2')
+              |""".stripMargin)
+        sql("insert into local.db.t_changelog_mixed_formats values (0, 'seed')")
+        val startSnapshotId = currentSnapshotId("local.db.t_changelog_mixed_formats")
+        sql("insert into local.db.t_changelog_mixed_formats values (1, 'parquet')")
+        sql("""
+              |alter table local.db.t_changelog_mixed_formats
+              |set tblproperties ('write.format.default' = 'orc')
+              |""".stripMargin)
+        sql("insert into local.db.t_changelog_mixed_formats values (2, 'orc')")
+        val endSnapshotId = currentSnapshotId("local.db.t_changelog_mixed_formats")
+        createChangelogView(
+          "local.db.t_changelog_mixed_formats",
+          "t_changelog_mixed_formats_changes",
+          startSnapshotId,
+          endSnapshotId)
+
+        val query =
+          """
+            |select id, v, _change_type, _change_ordinal, _commit_snapshot_id
+            |from t_changelog_mixed_formats_changes
+            |order by id
+            |""".stripMargin
+        var expected: Seq[Row] = Nil
+        withSQLConf("spark.auron.enabled" -> "false") {
+          expected = sql(query).collect().toSeq
+        }
+        val changelogTasks = changelogScanTasks(query)
+        assert(changelogTasks.forall(_.isInstanceOf[AddedRowsScanTask]), changelogTasks)
+        val formats = changelogTasks.collect { case task: AddedRowsScanTask =>
+          task.file().format()
+        }
+        assert(formats.toSet == Set(FileFormat.PARQUET, FileFormat.ORC), formats)
+        withSQLConf(
+          "spark.auron.enabled" -> "true",
+          "spark.auron.enable.iceberg.scan" -> "true") {
+          val df = sql(query)
+          checkAnswer(df, expected)
+          val plan = df.queryExecution.executedPlan.toString()
+          assert(!plan.contains("NativeIcebergTableScan"))
+        }
+      }
+    }
+  }
+
+  test("iceberg scan falls back when reading unsupported metadata columns") {
+    withTable("local.db.t4_pos") {
+      sql("create table local.db.t4_pos using iceberg as select 1 as id, 'a' as v")
+      withSQLConf("spark.auron.enabled" -> "true", "spark.auron.enable.iceberg.scan" -> "true") {
+        val df = sql("select _pos from local.db.t4_pos")
+        df.collect()
+        val plan = df.queryExecution.executedPlan.toString()
+        assert(!plan.contains("NativeIcebergTableScan"))
+      }
+    }
+  }
+
+  test("iceberg scan falls back for unsupported decimal types") {
+    withTable("local.db.t5") {
+      sql("create table local.db.t5 (id int, amount decimal(38, 10)) using iceberg")
+      sql("insert into local.db.t5 values (1, 123.45)")
+      val df = sql("select * from local.db.t5")
+      checkAnswer(df, Seq(Row(1, new java.math.BigDecimal("123.4500000000"))))
+      val plan = df.queryExecution.executedPlan.toString()
+      assert(!plan.contains("NativeIcebergTableScan"))
+      val neverConvertReasonTag: TreeNodeTag[String] = TreeNodeTag("auron.never.convert.reason")
+      assert(
+        collectFirst(df.queryExecution.executedPlan) { case batchScanExec: BatchScanExec =>
+          batchScanExec.getTagValue(neverConvertReasonTag)
+        }.get.get.equals(
+          "Unsupported Iceberg scan schema. Unsupported fields/types: amount: decimal(38,10)."))
+    }
+  }
+
+  test("iceberg scan falls back when delete files exist") {
+    withTable("local.db.t_delete") {
+      sql("""
+            |create table local.db.t_delete (id int, v string)
+            |using iceberg
+            |tblproperties (
+            |  'format-version' = '2',
+            |  'write.delete.mode' = 'merge-on-read'
+            |)
+            |""".stripMargin)
+      sql("insert into local.db.t_delete values (1, 'a'), (2, 'b')")
+      addPositionDeleteFile("local.db.t_delete")
+      val icebergTable = Spark3Util.loadIcebergTable(spark, "local.db.t_delete")
+      val scanTasks = icebergTable.newScan().planFiles()
+      val hasDeletes =
+        try {
+          scanTasks
+            .iterator()
+            .asScala
+            .exists(task => task.deletes() != null && !task.deletes().isEmpty)
+        } finally {
+          scanTasks.close()
+        }
+      assert(hasDeletes)
+      val df = sql("select * from local.db.t_delete")
+      df.collect()
+      val plan = df.queryExecution.executedPlan.toString()
+      assert(!plan.contains("NativeIcebergTableScan"))
+    }
+  }
+
+  test("iceberg scan is disabled via spark.auron.enable.iceberg.scan") {
+    withTable("local.db.t_disable") {
+      sql("create table local.db.t_disable using iceberg as select 1 as id, 'a' as v")
+      withSQLConf("spark.auron.enable.iceberg.scan" -> "false") {
+        assert(
+          !org.apache.auron.spark.configuration.SparkAuronConfiguration.ENABLE_ICEBERG_SCAN.get())
+        val df = sql("select * from local.db.t_disable")
+        df.collect()
+        val plan = df.queryExecution.executedPlan.toString()
+        assert(!plan.contains("NativeIcebergTableScan"))
+      }
+    }
+  }
+
+  private def addPositionDeleteFile(tableName: String): Unit = {
+    val table = Spark3Util.loadIcebergTable(spark, tableName)
+    val taskIterable = table.newScan().planFiles()
+    val taskIter = taskIterable.iterator()
+    if (!taskIter.hasNext) {
+      taskIterable.close()
+      return
+    }
+
+    try {
+      val task = taskIter.next().asInstanceOf[FileScanTask]
+      val deletePath =
+        table.locationProvider().newDataLocation(s"delete-${UUID.randomUUID().toString}.parquet")
+      val outputFile = table.io().newOutputFile(deletePath)
+      val encryptedOutput = table.encryption().encrypt(outputFile)
+      val appenderFactory = new GenericAppenderFactory(table.schema(), table.spec())
+      val writer =
+        appenderFactory.newPosDeleteWriter(encryptedOutput, FileFormat.PARQUET, task.partition())
+
+      val delete = PositionDelete.create[Record]().set(task.file().location(), 0L, null)
+      writer.write(delete)
+      writer.close()
+
+      val deleteFile = writer.toDeleteFile()
+      table.newRowDelta().addDeletes(deleteFile).commit()
+    } finally {
+      taskIterable.close()
+    }
+  }
+
+  private def createChangelogView(
+      tableName: String,
+      viewName: String,
+      startSnapshotId: Long,
+      endSnapshotId: Long): Unit = {
+    val tableIdent = tableName.stripPrefix("local.")
+    sql(s"""
+         |CALL local.system.create_changelog_view(
+         |  table => '$tableIdent',
+         |  changelog_view => '$viewName',
+         |  options => map(
+         |    'start-snapshot-id', '$startSnapshotId',
+         |    'end-snapshot-id', '$endSnapshotId'
+         |  )
+         |)
+         |""".stripMargin)
+  }
+
+  private def rawChangelogScan(
+      tableName: String,
+      startSnapshotId: Long,
+      endSnapshotId: Long): BatchScanExec = {
+    spark.read
+      .option("start-snapshot-id", startSnapshotId)
+      .option("end-snapshot-id", endSnapshotId)
+      .table(s"$tableName.changes")
+      .queryExecution
+      .sparkPlan
+      .collectFirst {
+        case scan: BatchScanExec if isChangelogScan(scan.scan) => scan
+      }
+      .getOrElse {
+        throw new AssertionError(s"Cannot find changelog BatchScanExec for table: $tableName")
+      }
+  }
+
+  private def currentSnapshotId(tableName: String): Long =
+    Spark3Util.loadIcebergTable(spark, tableName).currentSnapshot().snapshotId()
+
+  private def checkSparkAnswerAndOperator(sqlText: String): DataFrame = {
+    var expected: Seq[Row] = Nil
+    withSQLConf("spark.auron.enabled" -> "false") {
+      val iceberg = sql(sqlText)
+      expected = iceberg.collect().toSeq
+      val plan = iceberg.queryExecution.executedPlan.toString()
+      assert(!plan.contains("NativeIcebergTableScan"), plan)
+      assert(plan.contains("BatchScan"), plan)
+    }
+
+    var df: DataFrame = null
+    withSQLConf("spark.auron.enabled" -> "true", "spark.auron.enable.iceberg.scan" -> "true") {
+      df = sql(sqlText)
+      checkAnswer(df, expected)
+      val plan = df.queryExecution.executedPlan.toString()
+      assert(plan.contains("NativeIcebergTableScan"), plan)
+    }
+    df
+  }
+
+  private def checkNativeDppScan(
+      df: DataFrame,
+      expected: Seq[Row],
+      tableName: String,
+      expectedFiles: Long,
+      expectedPartitions: Long): NativeIcebergTableScanExec = {
+    checkAnswer(df, expected)
+
+    val nativeScan = executedNativeIcebergTableScanExec(df, tableName)
+    assert(nativeScan.runtimeFilters.nonEmpty, df.queryExecution.explainString(FormattedMode))
+    assert(nativeScan.metrics("numFiles").value === expectedFiles)
+    assert(nativeScan.metrics("numPartitions").value === expectedPartitions)
+
+    val explain = df.queryExecution.explainString(FormattedMode)
+    assert(explain.contains("NativeIcebergTableScan"), explain)
+    assert(explain.toLowerCase(Locale.ROOT).contains("dynamicpruning"), explain)
+
+    nativeScan
+  }
+
+  private def changelogScanTasks(sqlText: String): Seq[ChangelogScanTask] = {
+    val scan = sql(sqlText).queryExecution.sparkPlan
+      .collectFirst {
+        case batchScan: BatchScanExec if isChangelogScan(batchScan.scan) =>
+          batchScan
+      }
+      .getOrElse {
+        throw new AssertionError(s"Cannot find changelog BatchScanExec for query: $sqlText")
+      }
+
+    val tasks =
+      scan.scan.toBatch.planInputPartitions().toSeq.flatMap { partition =>
+        icebergScanTasks(partition)
+      }
+    assert(tasks.forall(_.isInstanceOf[ChangelogScanTask]), tasks)
+    tasks.collect { case task: ChangelogScanTask => task }
+  }
+
+  private def isChangelogScan(scan: org.apache.spark.sql.connector.read.Scan): Boolean =
+    scan.getClass.getName == "org.apache.iceberg.spark.source.SparkChangelogScan"
+
+  private def icebergScanTasks(partition: AnyRef): Seq[ScanTask] = {
+    try {
+      val taskGroupField = partition.getClass.getDeclaredField("taskGroup")
+      taskGroupField.setAccessible(true)
+      val taskGroup = taskGroupField.get(partition)
+
+      val tasksMethod = taskGroup.getClass.getDeclaredMethod("tasks")
+      tasksMethod.setAccessible(true)
+      tasksMethod
+        .invoke(taskGroup)
+        .asInstanceOf[java.util.Collection[_]]
+        .asScala
+        .collect { case task: ScanTask =>
+          task
+        }
+        .toSeq
+    } catch {
+      case NonFatal(t) =>
+        throw new AssertionError(
+          s"Cannot read Iceberg scan tasks from ${partition.getClass.getName}",
+          t)
+    }
+  }
+
+  private def icebergScanPlan(df: DataFrame) =
+    df.queryExecution.sparkPlan.collectFirst { case scan: BatchScanExec =>
+      IcebergScanSupport.plan(scan)
+    }.flatten
+
+  private def executedNativeIcebergTableScanExec(
+      df: DataFrame,
+      tableName: String = ""): NativeIcebergTableScanExec = {
+    val plan = df.queryExecution.executedPlan match {
+      case adaptive: AdaptiveSparkPlanExec => adaptive.executedPlan
+      case other => other
+    }
+    val nativeScan = collectMaterializedPlans(plan).collectFirst {
+      case scan: NativeIcebergTableScanExec
+          if tableName.isEmpty || scan.basedScan.scan.description().contains(tableName) =>
+        scan
+    }
+    assert(
+      nativeScan.nonEmpty,
+      s"""
+         |No NativeIcebergTableScanExec found.
+         |
+         |Materialized plan:
+         |${plan.treeString}
+         |""".stripMargin)
+    nativeScan.get
+  }
+
+  private def collectMaterializedPlans(plan: SparkPlan): Seq[SparkPlan] = {
+    val actualPlan = plan match {
+      case stage: QueryStageExec => stage.plan
+      case other => other
+    }
+    actualPlan +: actualPlan.children.flatMap(collectMaterializedPlans)
+  }
+
+  test("native iceberg scan respects SinglePartition for global sort correctness") {
+    withTable("local.db.t_global_sort") {
+      sql("create table local.db.t_global_sort (id int, value string) using iceberg")
+      sql("insert into local.db.t_global_sort values (4, 'd'), (1, 'a')")
+      sql("insert into local.db.t_global_sort values (3, 'c'), (2, 'b')")
+
+      val df = sql("select id, value from local.db.t_global_sort order by id")
+      val result = df.collect().map(_.getInt(0)).toSeq
+      assert(result === Seq(1, 2, 3, 4), s"Global ORDER BY must produce [1,2,3,4], got: $result")
+      assert(df.queryExecution.executedPlan.toString().contains("NativeIcebergTableScan"))
+      assert(df.rdd.getNumPartitions === 1)
+    }
+  }
+}

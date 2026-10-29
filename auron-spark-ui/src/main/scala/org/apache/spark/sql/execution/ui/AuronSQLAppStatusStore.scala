@@ -1,0 +1,100 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.spark.sql.execution.ui
+
+import scala.collection.JavaConverters._
+import scala.util.control.NonFatal
+
+import com.fasterxml.jackson.annotation.JsonIgnore
+import org.apache.spark.internal.Logging
+import org.apache.spark.util.kvstore.{KVIndex, KVStore}
+
+import org.apache.auron.spark.ui.AuronPlanDiagnosticEvent
+
+class AuronSQLAppStatusStore(store: KVStore) extends Logging {
+
+  private val sparkStore = new SQLAppStatusStore(store)
+
+  def execution(id: Long): Option[AuronExecutionUIData] = {
+    try Some(store.read(classOf[AuronExecutionUIData], id))
+    catch { case _: NoSuchElementException => None }
+  }
+
+  def executionsCount(): Long = store.count(classOf[AuronExecutionUIData])
+
+  def executions(offset: Int, limit: Int): Seq[AuronExecutionUIData] = {
+    val iter = store
+      .view(classOf[AuronExecutionUIData])
+      .reverse()
+      .skip(offset)
+      .max(limit)
+      .closeableIterator()
+    try iter.asScala.toVector
+    finally iter.close()
+  }
+
+  def metrics(id: Long): Seq[(String, String, String)] = {
+    try {
+      val values = sparkStore.executionMetrics(id)
+      sparkStore
+        .planGraph(id)
+        .allNodes
+        .flatMap { node =>
+          node.metrics.map { metric =>
+            (
+              s"${node.id}: ${node.name}",
+              metric.name,
+              values.getOrElse(metric.accumulatorId, "Not available yet"))
+          }
+        }
+        .toVector
+    } catch {
+      case _: NoSuchElementException => Seq.empty
+    }
+  }
+
+  def buildInfo(): Option[AuronBuildInfoUIData] = {
+    val kClass = classOf[AuronBuildInfoUIData]
+    // KVStore throws when the record doesn't exist; treat missing data as "no build info".
+    try {
+      Option(store.read(kClass, kClass.getName))
+    } catch {
+      case _: NoSuchElementException => None
+      case NonFatal(e) =>
+        logWarning("Failed to read BuildInfo from KVStore", e)
+        None
+    }
+  }
+}
+
+class AuronBuildInfoUIData(val info: Seq[(String, String)]) {
+  @JsonIgnore
+  @KVIndex
+  def id: String = classOf[AuronBuildInfoUIData].getName()
+}
+
+/** Stored independently of Spark's SQL records so retention uses the matching record count. */
+class AuronExecutionUIData(
+    val executionId: Long,
+    val description: String,
+    val startedAt: Long,
+    val endedAt: Long,
+    val snapshots: Seq[AuronPlanDiagnosticEvent]) {
+  @JsonIgnore
+  @KVIndex
+  def id: Long = executionId
+}

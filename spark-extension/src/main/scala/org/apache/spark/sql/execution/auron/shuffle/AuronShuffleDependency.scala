@@ -1,0 +1,67 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.spark.sql.execution.auron.shuffle
+
+import scala.reflect.ClassTag
+
+import org.apache.spark.{Aggregator, Partition, Partitioner, ShuffleDependency, SparkEnv}
+import org.apache.spark.internal.Logging
+import org.apache.spark.rdd.RDD
+import org.apache.spark.serializer.Serializer
+import org.apache.spark.shuffle.{BaseShuffleHandle, ShuffleHandle, ShuffleWriteProcessor}
+import org.apache.spark.sql.types.StructType
+
+import org.apache.auron.sparkver
+
+class AuronShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
+    @transient private val _rdd: RDD[_ <: Product2[K, V]],
+    override val partitioner: Partitioner,
+    override val serializer: Serializer = SparkEnv.get.serializer,
+    override val keyOrdering: Option[Ordering[K]] = None,
+    override val aggregator: Option[Aggregator[K, V, C]] = None,
+    override val mapSideCombine: Boolean = false,
+    override val shuffleWriterProcessor: ShuffleWriteProcessor = new ShuffleWriteProcessor,
+    val schema: StructType,
+    val rddPartitions: Array[Partition] = null)
+    extends ShuffleDependency[K, V, C](
+      _rdd,
+      partitioner,
+      serializer,
+      keyOrdering,
+      aggregator,
+      mapSideCombine,
+      shuffleWriterProcessor) {
+
+  // Serialize _rdd
+  val inputRdd: RDD[_ <: Product2[K, V]] = getInputRdd
+
+  // Spark 3+: Not required
+  @sparkver("3.0 / 3.1 / 3.2 / 3.3 / 3.4 / 3.5")
+  def getInputRdd: RDD[_ <: Product2[K, V]] = null
+
+  // For Spark 4+ compatibility: _rdd is required to create NativeRDD.ShuffleWrite in ShuffleWriteProcessor.write
+  @sparkver("4.0 / 4.1 / 4.2")
+  def getInputRdd: RDD[_ <: Product2[K, V]] = _rdd
+}
+
+object AuronShuffleDependency extends Logging {
+  def isArrowShuffle(handle: ShuffleHandle): Boolean = {
+    val base = handle.asInstanceOf[BaseShuffleHandle[_, _, _]]
+    val dep = base.dependency
+    dep.isInstanceOf[AuronShuffleDependency[_, _, _]]
+  }
+}

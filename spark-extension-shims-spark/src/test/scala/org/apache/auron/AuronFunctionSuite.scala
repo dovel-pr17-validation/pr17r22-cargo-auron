@@ -1,0 +1,1935 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.auron
+
+import java.text.SimpleDateFormat
+
+import org.apache.spark.sql.{AuronQueryTest, Row}
+import org.apache.spark.sql.auron.NativeConverters
+import org.apache.spark.sql.catalyst.expressions.Alias
+import org.apache.spark.sql.execution.ProjectExec
+import org.apache.spark.sql.execution.auron.plan.NativeProjectBase
+import org.apache.spark.sql.functions.{col, split}
+import org.apache.spark.sql.internal.SQLConf
+
+import org.apache.auron.util.{AuronTestUtils, SparkVersionUtil}
+
+class AuronFunctionSuite extends AuronQueryTest with BaseAuronSQLSuite {
+
+  test("float comparisons follow Spark NaN and signed zero ordering") {
+    withTable("t_float_ordering") {
+      sql(
+        "create table t_float_ordering (d1 double, d2 double, f1 float, f2 float) using parquet")
+      sql("""insert into t_float_ordering values
+          |  (0.0, -0.0, cast(0.0 as float), cast(-0.0 as float)),
+          |  (cast('NaN' as double), cast('NaN' as double),
+          |   cast('NaN' as float), cast('NaN' as float)),
+          |  (cast('NaN' as double), cast('Infinity' as double),
+          |   cast('NaN' as float), cast('Infinity' as float)),
+          |  (null, 1.0, null, cast(1.0 as float))
+          |""".stripMargin)
+
+      checkSparkAnswerAndOperator("""select
+          |  d1 = d2, not (d1 = d2), d1 < d2, d1 <= d2, d1 > d2, d1 >= d2, d1 <=> d2,
+          |  f1 = f2, not (f1 = f2), f1 < f2, f1 <= f2, f1 > f2, f1 >= f2, f1 <=> f2
+          |from t_float_ordering
+          |""".stripMargin)
+    }
+  }
+
+  test("float scan filters preserve NaN and signed zero results") {
+    Seq("parquet", "orc").foreach { format =>
+      withTable("t_float_scan") {
+        sql(s"create table t_float_scan (d double) using $format")
+        sql("""insert into t_float_scan values
+            |  (0.0), (-0.0), (cast('NaN' as double))
+            |""".stripMargin)
+
+        // Spark 3.0/3.1 ORC pushdown can drop NaN before evaluating this filter.
+        val greaterThan = sql("select d from t_float_scan where d > 100.0")
+        checkAnswer(greaterThan, Seq(Row(Double.NaN)))
+        assertPlanIsNative(greaterThan)
+        checkSparkAnswerAndOperator("select d from t_float_scan where d = 0.0")
+
+        val notIn = sql("select count(*) from t_float_scan where d not in (100.0, 200.0)")
+        checkAnswer(notIn, Seq(Row(3L)))
+        assertPlanIsNative(notIn)
+      }
+    }
+  }
+
+  test("float min and max follow Spark NaN ordering") {
+    withTable("t_float_ordering") {
+      sql("create table t_float_ordering (d double, f float) using parquet")
+      sql("""insert into t_float_ordering values
+          |  (cast('Infinity' as double), cast('Infinity' as float)),
+          |  (cast('NaN' as double), cast('NaN' as float)),
+          |  (-1.0, cast(-1.0 as float)),
+          |  (null, null)
+          |""".stripMargin)
+
+      checkSparkAnswerAndOperator(
+        "select isnan(max(d)), min(d), isnan(max(f)), min(f) from t_float_ordering")
+    }
+  }
+
+  test("sum function with float input") {
+    if (AuronTestUtils.isSparkV31OrGreater) {
+      withTable("t1") {
+        sql("create table t1 using parquet as select 1.0f as c1")
+        checkSparkAnswerAndOperator("select sum(c1) from t1")
+      }
+    }
+  }
+
+  test("sha2 function") {
+    // SPARK-36836: In Spark 3.0/3.1, sha2(..., 224) may produce garbled UTF instead of hex.
+    // For < 3.2, compare against known hex outputs directly; for >= 3.2, compare to Spark baseline.
+    withTable("t1") {
+      sql("create table t1 using parquet as select 'spark' as c1, '3.x' as version")
+      val functions =
+        """
+          |select
+          |  sha2(concat(c1, version), 256) as sha0,
+          |  sha2(concat(c1, version), 256) as sha256,
+          |  sha2(concat(c1, version), 224) as sha224,
+          |  sha2(concat(c1, version), 384) as sha384,
+          |  sha2(concat(c1, version), 512) as sha512
+          |from t1
+          |""".stripMargin
+      if (AuronTestUtils.isSparkV32OrGreater) {
+        checkSparkAnswerAndOperator(functions)
+      } else {
+        val df = sql(functions)
+        // Expected hex for input concat('spark','3.x')
+        val expected = Seq(
+          Row(
+            "562d20689257f3f3a04ee9afb86d0ece2af106cf6c6e5e7d266043088ce5fbc0", // sha0 (256)
+            "562d20689257f3f3a04ee9afb86d0ece2af106cf6c6e5e7d266043088ce5fbc0", // sha256
+            "d0c8e9ccd5c7b3fdbacd2cfd6b4d65ca8489983b5e8c7c64cd77b634", // sha224
+            "77c1199808053619c29e9af2656e1ad2614772f6ea605d5757894d6aec2dfaf34ff6fd662def3b79e429e9ae5ecbfed1", // sha384
+            "c4e27d35517ca62243c1f322d7922dac175830be4668e8a1cf3befdcd287bb5b6f8c5f041c9d89e4609c8cfa242008c7c7133af1685f57bac9052c1212f1d089" // sha512
+          ))
+        checkAnswer(df, expected)
+      }
+    }
+  }
+
+  test("md5 function") {
+    withTable("t1") {
+      sql("create table t1 using parquet as select 'spark' as c1, '3.x' as version")
+      val functions =
+        """
+          |select b.md5
+          |from (
+          |  select c1, version from t1
+          |) a join (
+          |  select md5(concat(c1, version)) as md5 from t1
+          |) b on md5(concat(a.c1, a.version)) = b.md5
+          |""".stripMargin
+      checkSparkAnswerAndOperator(functions)
+    }
+  }
+
+  test("spark hash function") {
+    withTable("t1") {
+      sql("create table t1 using parquet as select array(1, 2) as arr")
+      val functions =
+        """
+          |select hash(arr) from t1
+          |""".stripMargin
+      checkSparkAnswerAndOperator(functions)
+    }
+  }
+
+  test("array_contains function") {
+    withTable("t1") {
+      sql("create table t1(id int, arr array<int>, value int) using parquet")
+      sql("""insert into t1 values
+          |  (0, array(1, 2), 2),
+          |  (1, array(1, 2), 3),
+          |  (2, array(null, 2), 2),
+          |  (3, array(2, null), 2),
+          |  (4, array(1, null), 3),
+          |  (5, array(), 1),
+          |  (6, null, 1),
+          |  (7, array(1), null),
+          |  (8, array(null), 1),
+          |  (9, array(), null),
+          |  (10, null, null)
+          |""".stripMargin)
+
+      for (ansiEnabled <- Seq("true", "false")) {
+        withSQLConf(SQLConf.ANSI_ENABLED.key -> ansiEnabled) {
+          val query = "select id, array_contains(arr, value) from t1"
+          checkSparkAnswerAndOperator(query)
+          checkAnswer(
+            sql(query),
+            Seq(
+              Row(0, true),
+              Row(1, false),
+              Row(2, true),
+              Row(3, true),
+              Row(4, null),
+              Row(5, false),
+              Row(6, null),
+              Row(7, null),
+              Row(8, null),
+              Row(9, null),
+              Row(10, null)))
+          checkSparkAnswerAndOperator("""select
+              |  array_contains(arr, 2),
+              |  array_contains(array(1, 2), value)
+              |from t1
+              |""".stripMargin)
+          checkSparkAnswerAndOperator("select id from t1 where array_contains(arr, value)")
+        }
+      }
+    }
+  }
+
+  test("array_contains function with atomic element types") {
+    withTable("t1") {
+      sql("""create table t1(
+          |  strings array<string>, s string,
+          |  bools array<boolean>, b boolean,
+          |  dates array<date>, d date,
+          |  timestamps array<timestamp>, ts timestamp,
+          |  decimals array<decimal(10, 2)>, n decimal(10, 2),
+          |  ints array<int>, l bigint) using parquet
+          |""".stripMargin)
+      sql("""insert into t1 values
+          |  (array('a', null, 'b'), 'b', array(true, null), true,
+          |   array(date'2024-02-29'), date'2024-02-29',
+          |   array(timestamp'2024-02-29 12:34:56'), timestamp'2024-02-29 12:34:56',
+          |   array(1.23, null, 4.56), 4.56, array(1, 2), 2),
+          |  (array('a'), 'A', array(false), true,
+          |   array(date'2024-02-29'), date'2024-03-01',
+          |   array(timestamp'2024-02-29 12:34:56'), timestamp'2024-02-29 12:34:57',
+          |   array(1.23), 4.56, array(1, 2), 3)
+          |""".stripMargin)
+      checkSparkAnswerAndOperator("""select
+          |  array_contains(strings, s), array_contains(bools, b),
+          |  array_contains(dates, d), array_contains(timestamps, ts),
+          |  array_contains(decimals, n), array_contains(ints, l)
+          |from t1
+          |""".stripMargin)
+    }
+  }
+
+  test("array_contains function with floating point elements") {
+    withTable("t1") {
+      sql("create table t1(arr array<double>, value double) using parquet")
+      sql("""insert into t1 values
+          |  (array(cast('NaN' as double)), cast('NaN' as double)),
+          |  (array(cast('-0.0' as double)), cast('0.0' as double)),
+          |  (array(cast('0.0' as double)), cast('-0.0' as double)),
+          |  (array(cast('Infinity' as double)), cast('Infinity' as double)),
+          |  (array(cast('-Infinity' as double)), cast('Infinity' as double)),
+          |  (array(cast('NaN' as double), null), 1.0),
+          |  (array(cast('NaN' as double)), 1.0),
+          |  (array(null, cast('NaN' as double)), cast('NaN' as double))
+          |""".stripMargin)
+      val query = """select
+          |  array_contains(arr, value),
+          |  array_contains(cast(arr as array<float>), cast(value as float))
+          |from t1
+          |""".stripMargin
+      checkSparkAnswerAndOperator(query)
+      checkAnswer(
+        sql(query),
+        Seq(
+          Row(true, true),
+          Row(true, true),
+          Row(true, true),
+          Row(true, true),
+          Row(false, false),
+          Row(null, null),
+          Row(false, false),
+          Row(true, true)))
+    }
+  }
+
+  test("array_contains function with complex elements falls back") {
+    withTable("t1") {
+      sql("""create table t1 using parquet as select
+          |  array(named_struct('a', cast(null as int))) as arr,
+          |  named_struct('a', cast(null as int)) as value
+          |union all select
+          |  array(named_struct('a', cast(null as int))), named_struct('a', 0)
+          |""".stripMargin)
+      val query = "select array_contains(arr, value) from t1"
+      for (fallbackEnabled <- Seq("false", "true")) {
+        withSQLConf("spark.auron.udf.singleChildFallback.enabled" -> fallbackEnabled) {
+          val df = sql(query)
+          checkAnswer(df, Seq(Row(true), Row(false)))
+          val plan = df.queryExecution.executedPlan
+          if (fallbackEnabled == "true") {
+            assertPlanIsNative(df)
+            val project = collectFirst(plan) { case p: NativeProjectBase => p }.get
+            val expression = project.expressions.collectFirst { case a: Alias => a.child }.get
+            val nativeExpr = NativeConverters.convertExpr(expression)
+            assert(nativeExpr.hasSparkUdfWrapperExpr)
+          } else {
+            assert(collectFirst(plan) { case _: ProjectExec => true }.contains(true))
+          }
+        }
+      }
+    }
+  }
+
+  test("flatten function with mixed child array nullability") {
+    withTable("t1") {
+      sql("""
+          |create table t1 using parquet as
+          |select
+          |  array(array(1, 2), array(3, cast(null as int)), array()) as ints,
+          |  array(array(named_struct('a', 1)), array(named_struct('a', 2))) as structs
+          |union all
+          |select
+          |  array(array(4), cast(null as array<int>)),
+          |  array(array(named_struct('a', 3)), cast(array() as array<struct<a:int>>))
+          |union all
+          |select
+          |  cast(array() as array<array<int>>),
+          |  cast(array() as array<array<struct<a:int>>>)
+          |union all
+          |select
+          |  cast(null as array<array<int>>),
+          |  cast(null as array<array<struct<a:int>>>)
+          |""".stripMargin)
+
+      checkSparkAnswerAndOperator("select flatten(ints), flatten(structs) from t1")
+    }
+  }
+
+  test("expm1 function") {
+    withTable("t1") {
+      sql("create table t1(c1 double) using parquet")
+      sql("insert into t1 values(0.0), (1.1), (2.2)")
+      checkSparkAnswerAndOperator("select expm1(c1) from t1")
+    }
+  }
+
+  test("factorial function") {
+    withTable("t1") {
+      sql("create table t1(c1 int) using parquet")
+      sql("insert into t1 values(5)")
+      checkSparkAnswerAndOperator("select factorial(c1) from t1")
+    }
+  }
+
+  test("array_distinct function") {
+    withTable("t1") {
+      sql("create table t1(id int, arr array<int>) using parquet")
+      sql("""insert into t1 values
+          |  (0, array(3, 1, 3, 2, 1)),
+          |  (1, array(1, null, 1, null, 2)),
+          |  (2, array()),
+          |  (3, null),
+          |  (4, array(null, null)),
+          |  (5, array(2, 2, 1))
+          |""".stripMargin)
+      val query = "select id, array_distinct(arr) from t1"
+      for (ansi <- Seq("false", "true")) {
+        withSQLConf(SQLConf.ANSI_ENABLED.key -> ansi) {
+          checkSparkAnswerAndOperator(query)
+          checkAnswer(
+            sql(query),
+            Seq(
+              Row(0, Seq(3, 1, 2)),
+              Row(1, Seq[Integer](1, null, 2)),
+              Row(2, Seq.empty[Int]),
+              Row(3, null),
+              Row(4, Seq(null)),
+              Row(5, Seq(2, 1))))
+        }
+      }
+    }
+  }
+
+  test("array_distinct function with atomic element types") {
+    withTable("t1") {
+      sql("""create table t1 using parquet as select
+          |  array('b', 'a', 'b', null, null) as strings,
+          |  array(true, false, true, null) as bools,
+          |  array(cast(2 as tinyint), cast(1 as tinyint), cast(2 as tinyint)) as bytes,
+          |  array(cast(2 as smallint), cast(1 as smallint), cast(2 as smallint)) as shorts,
+          |  array(2L, 1L, 2L, null) as longs,
+          |  array(date'2024-02-29', date'1970-01-01', date'2024-02-29', null) as dates,
+          |  array(timestamp'2024-02-29 12:34:56', timestamp'1970-01-01 00:00:00',
+          |    timestamp'2024-02-29 12:34:56', null) as timestamps,
+          |  array(cast(2.5 as decimal(10, 2)), cast(1 as decimal(10, 2)),
+          |    cast(2.5 as decimal(10, 2)), null) as decimals,
+          |  array(cast('b' as binary), cast('a' as binary), cast('b' as binary), null) as binaries
+          |""".stripMargin)
+      checkSparkAnswerAndOperator("""select
+          |  array_distinct(strings), array_distinct(bools), array_distinct(bytes),
+          |  array_distinct(shorts), array_distinct(longs), array_distinct(dates),
+          |  array_distinct(timestamps), array_distinct(decimals), array_distinct(binaries)
+          |from t1
+          |""".stripMargin)
+    }
+  }
+
+  test("array_distinct function with floating point elements") {
+    if (AuronTestUtils.isSparkV31OrGreater) {
+      withTable("t1") {
+        sql("create table t1(id int, arr array<double>) using parquet")
+        sql("""insert into t1 values
+            |  (0, array(-0.0D, 0.0D, -0.0D, double('NaN'), double('NaN'), null)),
+            |  (1, array(0.0D, -0.0D, 0.0D, 2.0D, 2.0D)),
+            |  (2, array(double('Infinity'), double('-Infinity'), double('Infinity'))),
+            |  (3, array()),
+            |  (4, null)
+            |""".stripMargin)
+        val query = """select id, array_distinct(arr),
+            |  array_distinct(cast(arr as array<float>)) from t1
+            |""".stripMargin
+        checkSparkAnswerAndOperator(query)
+        val first = sql(query).collect().find(_.getInt(0) == 0).get
+        val expectedZero = if (SparkVersionUtil.SPARK_RUNTIME_VERSION >= "4.2") 0.0 else -0.0
+        assert(
+          java.lang.Double.doubleToRawLongBits(first.getSeq[Double](1).head) ==
+            java.lang.Double.doubleToRawLongBits(expectedZero))
+        assert(
+          java.lang.Float.floatToRawIntBits(first.getSeq[Float](2).head) ==
+            java.lang.Float.floatToRawIntBits(expectedZero.toFloat))
+      }
+    }
+  }
+
+  test("array_distinct function with unsupported elements falls back") {
+    withTable("t1") {
+      sql("""create table t1 using parquet as select
+          |  array(array(1, null), array(1, null), array(2)) as nested,
+          |  array(named_struct('v', 1), named_struct('v', 1), named_struct('v', 2)) as structs,
+          |  array(double('NaN'), double('NaN'), -0.0D, 0.0D) as doubles,
+          |  array(1, 2) as ints
+          |""".stripMargin)
+      val expressions =
+        Seq("array_distinct(nested)", "array_distinct(structs)", "transform(ints, x -> x + 1)")
+      withSQLConf("spark.auron.udf.singleChildFallback.enabled" -> "true") {
+        for (expression <- expressions) {
+          val query = s"select $expression from t1"
+          val expr = sql(query).queryExecution.analyzed.expressions.collectFirst {
+            case Alias(child, _) => child
+          }.get
+          assert(NativeConverters.convertExpr(expr).hasSparkUdfWrapperExpr)
+          checkSparkAnswerAndOperator(query)
+        }
+      }
+      if (!AuronTestUtils.isSparkV31OrGreater) {
+        // Spark 3.0's interpreted and code-generated paths differ for signed zero.
+        withSQLConf("spark.auron.udf.singleChildFallback.enabled" -> "false") {
+          val df = checkSparkAnswer("select array_distinct(doubles) from t1")
+          assert(stripAQEPlan(df.queryExecution.executedPlan).collectFirst {
+            case project: ProjectExec => project
+          }.nonEmpty)
+        }
+      }
+    }
+  }
+
+  test("hex function") {
+    withTable("t1") {
+      sql("create table t1(c1 int, c2 string) using parquet")
+      sql("insert into t1 values(17, 'Spark SQL')")
+      checkSparkAnswerAndOperator("select hex(c1), hex(c2) from t1")
+    }
+  }
+
+  test("dayofweek function") {
+    withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC") {
+      withTable("t1") {
+        sql("create table t1(c1 date, c2 timestamp) using parquet")
+        sql("""
+            |insert into t1 values
+            |  (date'2009-07-30', timestamp'2009-07-30 12:34:56'),
+            |  (date'2024-02-29', timestamp'2024-02-29 23:59:59'),
+            |  (null, null)
+            |""".stripMargin)
+
+        // DATE column
+        checkSparkAnswerAndOperator("select dayofweek(c1) from t1 where c1 is not null")
+
+        // NULL DATE input should return NULL
+        checkSparkAnswerAndOperator("select dayofweek(c1) from t1 where c1 is null")
+
+        // TIMESTAMP column
+        checkSparkAnswerAndOperator("select dayofweek(c2) from t1 where c2 is not null")
+
+        // NULL TIMESTAMP input should return NULL
+        checkSparkAnswerAndOperator("select dayofweek(c2) from t1 where c2 is null")
+      }
+    }
+  }
+
+  test("dayofyear function") {
+    withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC") {
+      withTable("t1") {
+        sql("create table t1(c1 date, c2 timestamp) using parquet")
+        sql("""
+            |insert into t1 values
+            |  (date'2016-04-09', timestamp'2016-04-09 12:34:56'),
+            |  (date'2023-12-31', timestamp'2023-12-31 23:59:59'),
+            |  (date'2024-12-31', timestamp'2024-12-31 23:59:59'),
+            |  (null, null)
+            |""".stripMargin)
+
+        checkSparkAnswerAndOperator("select dayofyear(c1), dayofyear(c2) from t1")
+      }
+    }
+  }
+
+  test("last_day function") {
+    withTable("t1") {
+      sql("create table t1(c1 date) using parquet")
+      sql("""insert into t1 values
+          |  (date'2009-01-12'),
+          |  (date'2024-02-10'),
+          |  (date'2023-02-10'),
+          |  (date'1969-12-01'),
+          |  (null)
+          |""".stripMargin)
+
+      checkSparkAnswerAndOperator("select last_day(c1) from t1")
+    }
+  }
+
+  test("trunc function") {
+    withTable("t1") {
+      sql("create table t1(dt date, fmt string) using parquet")
+      sql("""insert into t1 values
+          |  (date'2019-08-04', 'week'),
+          |  (date'2024-01-01', 'yY'),
+          |  (date'2023-01-01', 'WEEK'),
+          |  (date'2024-02-29', 'mm'),
+          |  (date'2000-05-31', 'QUARTER'),
+          |  (date'1969-12-31', 'MoN'),
+          |  (date'2024-02-29', 'DAY'),
+          |  (date'2024-02-29', 'HOUR'),
+          |  (date'2024-02-29', 'INVALID'),
+          |  (date'2024-02-29', ' MONTH '),
+          |  (date'2024-02-29', ''),
+          |  (null, 'YEAR'),
+          |  (date'2024-02-29', null)
+          |""".stripMargin)
+      for (ansi <- Seq("false", "true")) {
+        withSQLConf(SQLConf.ANSI_ENABLED.key -> ansi) {
+          checkSparkAnswerAndOperator(
+            "select trunc(dt, fmt), trunc(date'2024-02-29', fmt) from t1")
+          for (fmt <- Seq("YEAR", "YYYY", "yy", "QUARTER", "MONTH", "MM", "mon", "WEEK")) {
+            checkSparkAnswerAndOperator(s"select trunc(dt, '$fmt') from t1")
+          }
+        }
+      }
+    }
+  }
+
+  test("trunc function at Date32 boundaries") {
+    withTable("t1") {
+      sql("create table t1(days int) using parquet")
+      sql("insert into t1 values (-2147483648), (-2147483647), (2147483647), (0), (-1), (null)")
+      for (ansi <- Seq("false", "true")) {
+        withSQLConf(SQLConf.ANSI_ENABLED.key -> ansi) {
+          checkSparkAnswerAndOperator("""select
+              |  trunc(date_add(date'1970-01-01', days), 'YEAR'),
+              |  trunc(date_add(date'1970-01-01', days), 'MONTH'),
+              |  trunc(date_add(date'1970-01-01', days), 'WEEK')
+              |from t1""".stripMargin)
+          checkSparkAnswerAndOperator("""select
+              |  trunc(date_add(date'1970-01-01', days), 'QUARTER')
+              |from t1 where days >= 0""".stripMargin)
+          for (enabled <- Seq("false", "true")) {
+            withSQLConf("spark.auron.enable" -> enabled) {
+              val df = sql("""select
+                  |  trunc(date_add(date'1970-01-01', days), 'QUARTER')
+                  |from t1 where days < -2147483646""".stripMargin)
+              val error = intercept[Exception](df.collect())
+              if (enabled == "true") {
+                assertPlanIsNative(df)
+              }
+              assert(
+                allCauseMessages(error).toLowerCase(java.util.Locale.ROOT).contains("overflow"))
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test("next_day function") {
+    withTable("t1") {
+      sql("create table t1(start_date date, weekday string) using parquet")
+      sql("""insert into t1 values
+          |  (date'2024-01-01', 'MON'),
+          |  (date'2024-01-01', 'tuE'),
+          |  (date'2024-02-29', 'FRIDAY'),
+          |  (date'2024-12-31', 'TH'),
+          |  (date'1969-12-31', 'THURSDAY'),
+          |  (null, 'MON'),
+          |  (date'2024-01-01', null)
+          |""".stripMargin)
+
+      for (ansi <- Seq("false", "true")) {
+        withSQLConf(SQLConf.ANSI_ENABLED.key -> ansi) {
+          checkSparkAnswerAndOperator("""select
+              |  next_day(start_date, weekday),
+              |  next_day(start_date, 'MON'),
+              |  next_day(date'2024-01-01', weekday)
+              |from t1""".stripMargin)
+        }
+      }
+    }
+  }
+
+  test("next_day invalid weekday") {
+    withTable("t1") {
+      sql("create table t1(start_date date, weekday string) using parquet")
+      sql("""insert into t1 values
+          |  (date'2024-01-01', 'NODAY'),
+          |  (date'2024-01-01', ' MON ')
+          |""".stripMargin)
+      val query = "select next_day(start_date, weekday) from t1"
+
+      withSQLConf(SQLConf.ANSI_ENABLED.key -> "false") {
+        checkSparkAnswerAndOperator(query)
+      }
+      if (AuronTestUtils.isSparkV32OrGreater) {
+        withSQLConf(SQLConf.ANSI_ENABLED.key -> "true") {
+          for (enabled <- Seq("false", "true")) {
+            withSQLConf("spark.auron.enable" -> enabled) {
+              val df = sql(query)
+              val error = intercept[Exception](df.collect())
+              if (enabled == "true") {
+                assertPlanIsNative(df)
+              }
+              assert(
+                allCauseMessages(error)
+                  .toLowerCase(java.util.Locale.ROOT)
+                  .contains("day of week"))
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test("datediff function") {
+    withTable("t1") {
+      sql("create table t1(end_date date, start_date date) using parquet")
+      sql("""insert into t1 values
+          |  (date'2009-07-31', date'2009-07-30'),
+          |  (date'2009-07-30', date'2009-07-31'),
+          |  (date'2024-03-01', date'2024-02-28'),
+          |  (date'2024-01-01', date'2024-01-01'),
+          |  (date'2025-01-01', date'2024-12-31'),
+          |  (null, date'2024-01-01'),
+          |  (date'2024-01-01', null)
+          |""".stripMargin)
+
+      checkSparkAnswerAndOperator(
+        "select datediff(end_date, start_date), datediff(end_date, date'2024-01-01') from t1")
+    }
+  }
+
+  test("datediff function with non-UTC timestamp inputs") {
+    withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "America/Los_Angeles") {
+      withTable("t1") {
+        sql("create table t1(end_ts timestamp, start_ts timestamp) using parquet")
+        // The first pair has the same local date but different UTC dates; the next two
+        // cross local midnight within the same UTC date.
+        sql("""insert into t1 values
+            |  (timestamp'1970-01-01 16:30:00', timestamp'1970-01-01 00:30:00'),
+            |  (timestamp'1970-01-02 00:30:00', timestamp'1970-01-01 23:30:00'),
+            |  (timestamp'1970-01-01 23:30:00', timestamp'1970-01-02 00:30:00'),
+            |  (null, timestamp'1970-01-01 00:30:00'),
+            |  (timestamp'1970-01-01 00:30:00', null)
+            |""".stripMargin)
+
+        val query = "select datediff(end_ts, start_ts) from t1"
+        checkSparkAnswerAndOperator(query)
+        checkAnswer(sql(query), Seq(Row(0), Row(1), Row(-1), Row(null), Row(null)))
+      }
+    }
+  }
+
+  test("unix_date and date_from_unix_date functions") {
+    if (AuronTestUtils.isSparkV31OrGreater) {
+      withTable("t1") {
+        sql("create table t1(dt date, days int) using parquet")
+        sql("""insert into t1 values
+            |  (date'1970-01-01', 0),
+            |  (date'1969-12-31', -1),
+            |  (date'1970-01-02', 1),
+            |  (date'2000-02-29', 11016),
+            |  (null, null)
+            |""".stripMargin)
+
+        for (ansi <- Seq("false", "true")) {
+          withSQLConf(SQLConf.ANSI_ENABLED.key -> ansi) {
+            checkSparkAnswerAndOperator("""select
+                |  unix_date(dt), date_from_unix_date(days),
+                |  date_from_unix_date(unix_date(dt)),
+                |  unix_date(date_from_unix_date(days))
+                |from t1""".stripMargin)
+          }
+        }
+      }
+    }
+  }
+
+  test("unix_date and date_from_unix_date integer boundaries") {
+    if (AuronTestUtils.isSparkV31OrGreater) {
+      withTable("t1") {
+        sql("create table t1(days int) using parquet")
+        sql("insert into t1 values (-2147483648), (2147483647), (0), (null)")
+
+        for (ansi <- Seq("false", "true")) {
+          withSQLConf(SQLConf.ANSI_ENABLED.key -> ansi) {
+            // Compare epoch days without converting extreme dates to java.sql.Date.
+            checkSparkAnswerAndOperator("""select
+                |  unix_date(date_add(date'1970-01-01', days)),
+                |  datediff(date_from_unix_date(days), date'1970-01-01'),
+                |  unix_date(date_from_unix_date(days))
+                |from t1""".stripMargin)
+          }
+        }
+      }
+    }
+  }
+
+  test("date_add and date_sub functions") {
+    withTable("t1") {
+      sql("create table t1(start_date date, days int) using parquet")
+      sql("""insert into t1 values
+          |  (date'2024-02-28', 1),
+          |  (date'2024-03-01', -1),
+          |  (date'2023-03-01', 1),
+          |  (date'2024-01-31', 1),
+          |  (date'2024-12-31', 1),
+          |  (date'1969-12-31', 1),
+          |  (date'2024-01-01', 0),
+          |  (null, 1),
+          |  (date'2024-01-01', null)
+          |""".stripMargin)
+
+      for (ansi <- Seq("false", "true"); dayType <- Seq("tinyint", "smallint", "int")) {
+        withSQLConf(SQLConf.ANSI_ENABLED.key -> ansi) {
+          checkSparkAnswerAndOperator(s"""select
+              |  date_add(start_date, cast(days as $dayType)),
+              |  date_sub(start_date, cast(days as $dayType)),
+              |  date_add(start_date, 1), date_sub(start_date, -1),
+              |  date_add(date'2024-01-01', cast(days as $dayType)),
+              |  date_sub(date'2024-01-01', cast(days as $dayType))
+              |from t1""".stripMargin)
+        }
+      }
+    }
+  }
+
+  test("date_add and date_sub integer overflow") {
+    withTable("t1") {
+      sql("create table t1(start_date date, days int) using parquet")
+      sql("""insert into t1 values
+          |  (date'1970-01-02', 2147483647),
+          |  (date'1969-12-31', -2147483648),
+          |  (date'1970-01-01', -2147483648),
+          |  (date'1970-01-01', 2147483647)
+          |""".stripMargin)
+
+      for (ansi <- Seq("false", "true")) {
+        withSQLConf(SQLConf.ANSI_ENABLED.key -> ansi) {
+          // Compare epoch days without converting extreme dates to java.sql.Date.
+          checkSparkAnswerAndOperator("""select
+              |  datediff(date_add(start_date, days), date'1970-01-01'),
+              |  datediff(date_sub(start_date, days), date'1970-01-01')
+              |from t1""".stripMargin)
+        }
+      }
+    }
+  }
+
+  test("date_add and date_sub timestamp and string inputs") {
+    withTable("t1") {
+      sql("create table t1(ts timestamp, dt string, days int) using parquet")
+      withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC") {
+        sql("""insert into t1 values
+            |  (timestamp'1970-01-01 04:30:00', '1969-12-31', 1),
+            |  (timestamp'2024-03-01 04:30:00', '2024-02-29', -1),
+            |  (null, null, 1)
+            |""".stripMargin)
+      }
+      withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "America/Los_Angeles") {
+        checkSparkAnswerAndOperator("""select
+            |  date_add(ts, days), date_sub(ts, days),
+            |  date_add(dt, days), date_sub(dt, days)
+            |from t1""".stripMargin)
+      }
+    }
+  }
+
+  test("add_months function") {
+    withTable("t1") {
+      sql("create table t1(start_date date, months int) using parquet")
+      sql("""insert into t1 values
+          |  (date'2016-08-31', 1),
+          |  (date'2024-01-31', 1),
+          |  (date'2023-01-31', 1),
+          |  (date'2024-03-31', -1),
+          |  (date'2024-02-29', 12),
+          |  (date'2024-02-29', 1),
+          |  (date'2024-12-31', 2),
+          |  (date'1969-12-31', -13),
+          |  (date'2024-01-31', 0),
+          |  (null, 1),
+          |  (date'2024-01-01', null),
+          |  (null, null)
+          |""".stripMargin)
+
+      for (ansi <- Seq("false", "true")) {
+        withSQLConf(SQLConf.ANSI_ENABLED.key -> ansi) {
+          checkSparkAnswerAndOperator("""select
+              |  add_months(start_date, months),
+              |  add_months(start_date, 1), add_months(start_date, -1),
+              |  add_months(date'2024-01-31', months)
+              |from t1""".stripMargin)
+        }
+      }
+    }
+  }
+
+  test("add_months date range and overflow") {
+    withTable("t1") {
+      sql("create table t1(days int, months int) using parquet")
+      sql("""insert into t1 values
+          |  (2147483647, 0), (-2147483648, 0),
+          |  (2147483647, -1), (-2147483648, 1),
+          |  (100000000, -4800), (-100000000, 4800),
+          |  (0, 4800), (0, -4800)
+          |""".stripMargin)
+      for (ansi <- Seq("false", "true")) {
+        withSQLConf(SQLConf.ANSI_ENABLED.key -> ansi) {
+          // Compare epoch days to avoid java.sql.Date conversion for extreme dates.
+          checkSparkAnswerAndOperator("""select datediff(
+              |  add_months(date_add(date'1970-01-01', days), months), date'1970-01-01')
+              |from t1""".stripMargin)
+        }
+      }
+    }
+
+    withTable("t1") {
+      sql("create table t1(days int, months int) using parquet")
+      sql("""insert into t1 values
+          |  (2147483647, 1), (-2147483648, -1),
+          |  (0, 2147483647), (0, -2147483648)
+          |""".stripMargin)
+      val query = """select datediff(
+          |  add_months(date_add(date'1970-01-01', days), months), date'1970-01-01')
+          |from t1""".stripMargin
+      for (ansi <- Seq("false", "true")) {
+        withSQLConf(SQLConf.ANSI_ENABLED.key -> ansi) {
+          if (AuronTestUtils.isSparkV31OrGreater) {
+            for (enabled <- Seq("false", "true")) {
+              withSQLConf("spark.auron.enable" -> enabled) {
+                val df = sql(query)
+                val error = intercept[Exception](df.collect())
+                if (enabled == "true") {
+                  assertPlanIsNative(df)
+                }
+                assert(
+                  allCauseMessages(error).toLowerCase(java.util.Locale.ROOT).contains("overflow"))
+              }
+            }
+          } else {
+            checkSparkAnswerAndOperator(query)
+          }
+        }
+      }
+    }
+  }
+
+  test("add_months timestamp and string inputs") {
+    withTable("t1") {
+      sql("create table t1(ts timestamp, dt string, months int) using parquet")
+      withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC") {
+        sql("""insert into t1 values
+            |  (timestamp'2024-03-01 04:30:00', '2024-02-29', 1),
+            |  (timestamp'1970-01-01 04:30:00', '1969-12-31', -1),
+            |  (null, null, 1)
+            |""".stripMargin)
+      }
+      withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "America/Los_Angeles") {
+        checkSparkAnswerAndOperator(
+          "select add_months(ts, months), add_months(dt, months) from t1")
+      }
+    }
+  }
+
+  test("date-part functions with non-UTC timezone") {
+    withTable("t1") {
+      sql("create table t1(c1 timestamp) using parquet")
+      withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC") {
+        sql("insert into t1 values(timestamp'2021-01-04 04:30:00')")
+      }
+      withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "America/New_York") {
+        checkSparkAnswerAndOperator(
+          "select year(c1), month(c1), dayofmonth(c1), dayofyear(c1), dayofweek(c1), quarter(c1) from t1")
+      }
+    }
+  }
+
+  test("date-part functions with date input unchanged across timezones") {
+    withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "Asia/Shanghai") {
+      withTable("t1") {
+        sql("create table t1(c1 date) using parquet")
+        sql("insert into t1 values(date'2021-01-04')")
+        checkSparkAnswerAndOperator(
+          "select year(c1), month(c1), dayofmonth(c1), dayofyear(c1), dayofweek(c1), quarter(c1) from t1")
+      }
+    }
+  }
+
+  test("stddev_samp function with UDAF fallback") {
+    withSQLConf("spark.auron.udafFallback.enable" -> "true") {
+      withTable("t1") {
+        sql("create table t1(c1 double) using parquet")
+        sql("insert into t1 values(10.0), (20.0), (30.0), (31.0), (null)")
+        checkSparkAnswerAndOperator("select stddev_samp(c1) from t1")
+      }
+    }
+  }
+
+  test("regexp_extract function with UDF failback") {
+    withSQLConf("spark.auron.udf.singleChildFallback.enabled" -> "true") {
+      withTable("t1") {
+        sql("create table t1(c1 string) using parquet")
+        sql("insert into t1 values('Auron Spark SQL')")
+        checkSparkAnswerAndOperator("select regexp_extract(c1, '^A(.*)L$', 1) from t1")
+      }
+    }
+  }
+
+  test("split function with literal regex patterns") {
+    withTable("t1") {
+      sql("create table t1(c1 string, c2 string, c3 string) using parquet")
+      sql("insert into t1 values('a/b/c', 'a+b+c', 'a::b::c'), (null, null, null)")
+      checkSparkAnswerAndOperator { () =>
+        sql("select c1, c2, c3 from t1").select(
+          split(col("c1"), "/"),
+          split(col("c2"), "\\+"),
+          split(col("c3"), "::"))
+      }
+    }
+  }
+
+  test("split function with regex patterns falls back to Spark") {
+    withTable("t1") {
+      sql("create table t1(c1 string, c2 string, c3 string) using parquet")
+      sql("insert into t1 values('abc', 'a+b+c', 'a.b.c'), (null, null, null)")
+      val df = checkSparkAnswerAndOperator(
+        () =>
+          sql("select c1, c2, c3 from t1")
+            .select(split(col("c1"), ".+"), split(col("c2"), "[+]"), split(col("c3"), ".")),
+        requireNative = false)
+      val plan = stripAQEPlan(df.queryExecution.executedPlan)
+      assert(
+        plan.collectFirst { case op if !isNativeOrPassThrough(op) => op }.nonEmpty,
+        "regex split patterns should fall back to Spark")
+
+      val escapedBackslashDf = checkSparkAnswerAndOperator(
+        () => sql("select c2 from t1").select(split(col("c2"), "\\\\+")),
+        requireNative = false)
+      val escapedBackslashPlan = stripAQEPlan(escapedBackslashDf.queryExecution.executedPlan)
+      val escapedBackslashFallback = escapedBackslashPlan.collectFirst {
+        case op if !isNativeOrPassThrough(op) => op
+      }.nonEmpty
+      assert(
+        escapedBackslashFallback,
+        "split on repeated backslash regex should fall back to Spark")
+    }
+  }
+
+  test("weekofyear function") {
+    withSQLConf("spark.sql.session.timeZone" -> "America/Los_Angeles") {
+      withTable("t1") {
+        sql(
+          "create table t1(c1 date, c2 date, c3 date, c4 date, c5 timestamp, c6 string) using parquet")
+        sql("""insert into t1 values (
+            |  date'2009-07-30',
+            |  date'1980-12-31',
+            |  date'2016-01-01',
+            |  date'2017-01-01',
+            |  timestamp'2016-01-03 23:30:00',
+            |  '2016-01-01'
+            |)""".stripMargin)
+
+        val query =
+          """select
+            |  weekofyear(c1),
+            |  weekofyear(c2),
+            |  weekofyear(c3),
+            |  weekofyear(c4),
+            |  weekofyear(c5),
+            |  weekofyear(c6)
+            |from t1
+            |""".stripMargin
+        checkSparkAnswerAndOperator(query)
+      }
+    }
+  }
+
+  test("round function with varying scales for intPi") {
+    withTable("t2") {
+      sql("CREATE TABLE t2 (c1 INT) USING parquet")
+
+      val intPi: Int = 314159265
+      sql(s"INSERT INTO t2 VALUES($intPi)")
+
+      val scales = -6 to 6
+
+      scales.foreach { scale =>
+        checkSparkAnswerAndOperator(s"SELECT round(c1, $scale) AS xx FROM t2")
+      }
+    }
+  }
+
+  test("round function with varying scales for doublePi") {
+    withTable("t1") {
+      sql("create table t1(c1 double) using parquet")
+
+      val doublePi: Double = math.Pi
+      sql(s"insert into t1 values($doublePi)")
+      val scales = -6 to 6
+
+      scales.foreach { scale =>
+        checkSparkAnswerAndOperator(s"select round(c1, $scale) from t1")
+      }
+    }
+  }
+
+  test("round function with varying scales for floatPi") {
+    withTable("t1") {
+      sql("CREATE TABLE t1 (c1 FLOAT) USING parquet")
+
+      val floatPi: Float = math.Pi.toFloat
+      sql(s"INSERT INTO t1 VALUES($floatPi)")
+
+      val scales = -6 to 6
+
+      scales.foreach { scale =>
+        checkSparkAnswerAndOperator(s"select round(c1, $scale) from t1")
+      }
+    }
+  }
+
+  test("round function with varying scales for shortPi") {
+    withTable("t1") {
+      sql("CREATE TABLE t1 (c1 SMALLINT) USING parquet")
+
+      val shortPi: Short = 31415
+      sql(s"INSERT INTO t1 VALUES($shortPi)")
+
+      val scales = -6 to 6
+
+      scales.foreach { scale =>
+        checkSparkAnswerAndOperator(s"SELECT round(c1, $scale) FROM t1")
+      }
+    }
+  }
+
+  test("round function with varying scales for longPi") {
+    withTable("t1") {
+      sql("CREATE TABLE t1 (c1 BIGINT) USING parquet")
+
+      val longPi: Long = 31415926535897932L
+      sql(s"INSERT INTO t1 VALUES($longPi)")
+
+      val scales = -6 to 6
+      scales.foreach { scale =>
+        checkSparkAnswerAndOperator(s"SELECT round(c1, $scale) FROM t1")
+      }
+    }
+  }
+
+  test("pow and power functions should return identical results") {
+    withTable("t1") {
+      sql("create table t1 using parquet as select 2 as base, 3 as exponent")
+
+      val functions =
+        """
+          |select
+          |  power(base, exponent) as power_result,
+          |  pow(base, exponent) as pow_result
+          |from t1
+            """.stripMargin
+
+      checkSparkAnswerAndOperator(functions)
+    }
+  }
+
+  test("pow/power should accept mixed numeric types and return double") {
+    withTable("t1") {
+      sql("create table t1(c1 double, c2 double) using parquet")
+      sql("insert into t1 values(2, 3.0), (2.0, 3), (1.5, 2)")
+      checkSparkAnswerAndOperator("select pow(c1, c2) from t1")
+    }
+  }
+
+  test("pow: zero base with negative exponent yields +infinity") {
+    withTable("t1") {
+      sql("create table t1(c1 double, c2 double) using parquet")
+      sql("insert into t1 values(0.0, -2.5), (0.0, -3)")
+      checkSparkAnswerAndOperator("select pow(c1, c2) from t1")
+    }
+  }
+
+  test("pow: zero to the zero equals one") {
+    withTable("t1") {
+      sql("create table t1(c1 double, c2 double) using parquet")
+      sql("insert into t1 values(0.0, 0.0)")
+      checkSparkAnswerAndOperator("select pow(c1, c2) from t1")
+    }
+  }
+
+  test("pow: negative base with fractional exponent is NaN") {
+    withTable("t1") {
+      sql("create table t1(c1 double, c2 double) using parquet")
+      sql("insert into t1 values(-2, 0.5)")
+      checkSparkAnswerAndOperator("select pow(c1, c2) from t1")
+    }
+  }
+
+  test("pow null propagation") {
+    withTable("t1") {
+      sql("create table t1(c1 double, c2 double) using parquet")
+      sql("insert into t1 values(null, 2),(2, null),(null, null)")
+      checkSparkAnswerAndOperator("select pow(c1, c2) from t1")
+    }
+  }
+
+  test("map_concat function") {
+    withTable("t1") {
+      sql(
+        "create table t1(c1 map<string, int>, c2 map<string, int>, c3 map<string, int>) using parquet")
+      sql("""
+          |insert into t1 values
+          |  (map('a', 1), map('b', 2), map('c', 3)),
+          |  (map('d', 4), map('e', 5), map('f', 6)),
+          |  (null, map('x', 10), map('f', 20))
+          |""".stripMargin)
+      checkSparkAnswerAndOperator("select map_concat(c1, c2, c3) from t1")
+    }
+  }
+
+  test("map_from_arrays function") {
+    withTable("t1") {
+      sql("create table t1(c1 array<string>, c2 array<int>) using parquet")
+      sql("""
+          |insert into t1 values
+          |  (array('a', 'b'), array(1, 2)),
+          |  (array('x'), array(10)),
+          |  (null, array(20)),
+          |  (array('m', 'n'), array(null, 30))
+          |""".stripMargin)
+      checkSparkAnswerAndOperator("select map_from_arrays(c1, c2) from t1")
+    }
+  }
+
+  test("map_from_arrays rejects null keys") {
+    withTable("t1") {
+      sql("create table t1(c1 array<string>, c2 array<int>) using parquet")
+      sql("insert into t1 values (array('a', cast(null as string)), array(1, 2))")
+      val df = sql("select map_from_arrays(c1, c2) from t1")
+      val err = intercept[Exception] {
+        df.collect()
+      }
+      assert(allCauseMessages(err).toLowerCase.contains("null map keys"))
+      val plan = stripAQEPlan(df.queryExecution.executedPlan)
+      plan
+        .collectFirst { case op if !isNativeOrPassThrough(op) => op }
+        .foreach { op =>
+          fail(s"""
+               |Found non-native operator: ${op.nodeName}
+               |plan:
+               |${plan}""".stripMargin)
+        }
+    }
+  }
+
+  test("map_from_entries function") {
+    withTable("t1") {
+      sql("create table t1(c1 array<struct<k:string,v:int>>) using parquet")
+      sql("""
+          |insert into t1 values
+          |  (array(named_struct('k', 'a', 'v', 1), named_struct('k', 'b', 'v', 2))),
+          |  (array(named_struct('k', 'x', 'v', 10))),
+          |  (cast(null as array<struct<k:string,v:int>>)),
+          |  (array(cast(null as struct<k:string,v:int>), named_struct('k', 'z', 'v', 30))),
+          |  (array(named_struct('k', 'm', 'v', cast(null as int))))
+          |""".stripMargin)
+      checkSparkAnswerAndOperator("select map_from_entries(c1) from t1")
+    }
+  }
+
+  test("map_from_entries rejects null keys") {
+    withTable("t1") {
+      sql("create table t1(c1 array<struct<k:string,v:int>>) using parquet")
+      sql("""
+          |insert into t1 values
+          |  (array(named_struct('k', 'a', 'v', 1), named_struct('k', cast(null as string), 'v', 2)))
+          |""".stripMargin)
+      val df = sql("select map_from_entries(c1) from t1")
+      val err = intercept[Exception] {
+        df.collect()
+      }
+      val plan = stripAQEPlan(df.queryExecution.executedPlan)
+      plan
+        .collectFirst { case op if !isNativeOrPassThrough(op) => op }
+        .foreach { op =>
+          fail(s"""
+               |Found non-native operator: ${op.nodeName}
+               |plan:
+               |${plan}""".stripMargin)
+        }
+      assert(allCauseMessages(err).toLowerCase.contains("null map key"))
+    }
+  }
+
+  test("map_from_entries duplicate keys") {
+    withTable("t1") {
+      sql("create table t1(c1 array<struct<k:string,v:int>>) using parquet")
+      sql("""
+          |insert into t1 values
+          |  (array(named_struct('k', 'a', 'v', 1), named_struct('k', 'a', 'v', 2)))
+          |""".stripMargin)
+      val df = sql("select map_from_entries(c1) from t1")
+      val err = intercept[Exception] {
+        df.collect()
+      }
+      val plan = stripAQEPlan(df.queryExecution.executedPlan)
+      plan
+        .collectFirst { case op if !isNativeOrPassThrough(op) => op }
+        .foreach { op =>
+          fail(s"""
+               |Found non-native operator: ${op.nodeName}
+               |plan:
+               |${plan}""".stripMargin)
+        }
+      assert(allCauseMessages(err).toLowerCase.contains("duplicate key"))
+    }
+  }
+
+  private def allCauseMessages(err: Throwable): String = {
+    val messages = scala.collection.mutable.ArrayBuffer.empty[String]
+    var current = err
+    while (current != null) {
+      Option(current.getMessage).foreach(messages += _)
+      current = current.getCause
+    }
+    messages.mkString(" | caused by: ")
+  }
+
+  test("map_from_entries last win dedup policy") {
+    withTable("t1") {
+      sql("create table t1(c1 array<struct<k:string,v:int>>) using parquet")
+      sql("""
+          |insert into t1 values
+          |  (array(
+          |    named_struct('k', 'a', 'v', 1),
+          |    named_struct('k', 'b', 'v', 2),
+          |    named_struct('k', 'a', 'v', 3)))
+          |""".stripMargin)
+      withSQLConf(
+        SQLConf.MAP_KEY_DEDUP_POLICY.key -> SQLConf.MapKeyDedupPolicy.LAST_WIN.toString) {
+        checkSparkAnswerAndOperator("select map_from_entries(c1) from t1")
+      }
+    }
+  }
+
+  test("str_to_map function") {
+    withTable("t1") {
+      sql("create table t1(c1 string) using parquet")
+      sql("""
+          |insert into t1 values
+          |  ('a:1,b:2'),
+          |  ('a:1:2,b'),
+          |  (null)
+          |""".stripMargin)
+      checkSparkAnswerAndOperator("select str_to_map(c1) from t1")
+    }
+  }
+
+  test("str_to_map regex delimiters") {
+    withTable("t1") {
+      sql("create table t1(c1 string) using parquet")
+      sql("insert into t1 values ('a::1,,b:::2')")
+      checkSparkAnswerAndOperator("select str_to_map(c1, ',+', ':+') from t1")
+    }
+  }
+
+  test("str_to_map Java regex delimiters") {
+    withTable("t1") {
+      sql("create table t1(c1 string) using parquet")
+      sql("insert into t1 values ('a:1,b:2,c:3')")
+      checkSparkAnswerAndOperator("select str_to_map(c1, ',(?=b:|c:)', ':') from t1")
+    }
+  }
+
+  test("str_to_map duplicate keys") {
+    withTable("t1") {
+      sql("create table t1(c1 string) using parquet")
+      sql("insert into t1 values ('a:1,a:2')")
+      val df = sql("select str_to_map(c1) from t1")
+      val err = intercept[Exception] {
+        df.collect()
+      }
+      val plan = stripAQEPlan(df.queryExecution.executedPlan)
+      plan
+        .collectFirst { case op if !isNativeOrPassThrough(op) => op }
+        .foreach { op =>
+          fail(s"""
+               |Found non-native operator: ${op.nodeName}
+               |plan:
+               |${plan}""".stripMargin)
+        }
+      assert(allCauseMessages(err).toLowerCase.contains("duplicate key"))
+    }
+  }
+
+  test("str_to_map last win dedup policy") {
+    withTable("t1") {
+      sql("create table t1(c1 string) using parquet")
+      sql("insert into t1 values ('a:1,b:2,a:3')")
+      withSQLConf(
+        SQLConf.MAP_KEY_DEDUP_POLICY.key -> SQLConf.MapKeyDedupPolicy.LAST_WIN.toString) {
+        checkSparkAnswerAndOperator("select str_to_map(c1) from t1")
+      }
+    }
+  }
+
+  test("acosh null propagation") {
+    withTable("t1") {
+      sql("create table t1(c1 double) using parquet")
+      sql("insert into t1 values(null), (1.0), (2.0)")
+      checkSparkAnswerAndOperator("select acosh(c1) from t1")
+    }
+    withTable("t2") {
+      sql("create table t2(c1 double) using parquet")
+      sql("insert into t2 values(0.0), (-1.0)")
+      // acosh is defined on [1, inf), so out-of-domain inputs yield NaN. Vanilla Spark and the
+      // native engine may encode that NaN with different bits (checkSparkAnswerAndOperator
+      // compares doubles by raw bits), so compare NaN-ness via the natively-supported isnan.
+      checkSparkAnswerAndOperator("select isnan(acosh(c1)) from t2")
+    }
+  }
+
+  test("test function least") {
+    withTable("test_least") {
+      sql(
+        "create table test_least using parquet as select 1 as c1, 2 as c2, 'a' as c3, 'b' as c4, 'c' as c5")
+
+      val maxValue = Long.MaxValue
+      val minValue = Long.MinValue
+
+      val dateStringMin = "2015-01-01 08:00:00"
+      val dateStringMax = "2015-01-01 11:00:00"
+      var format = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+      val dateTimeStampMin = format.parse(dateStringMin).getTime
+      val dateTimeStampMax = format.parse(dateStringMax).getTime
+      format = new SimpleDateFormat("yyyy-MM-dd")
+
+      val functions =
+        s"""
+          |select
+          |    least(c4, c3, c5),
+          |    least(c1, c2, 1),
+          |    least(c1, c2, (-1)),
+          |    least(c4, c5, c3, c3, 'a'),
+          |    least(null, null),
+          |    least(c4, c3, c5, null),
+          |    least((-1.0), 2.5),
+          |    least((-1.0), 2),
+          |    least(CAST(-1.0 AS FLOAT), CAST(2.5 AS FLOAT)),
+          |    least(cast(1 as byte), cast(2 as byte)),
+          |    least('abc', 'aaaa'),
+          |    least(true, false),
+          |    least(cast("2015-01-01" as date), cast("2015-07-01" as date)),
+          |    least(${dateTimeStampMin}, ${dateTimeStampMax}),
+          |    least(${minValue}, ${maxValue})
+          |from
+          |    test_least
+        """.stripMargin
+
+      checkSparkAnswerAndOperator(functions)
+    }
+  }
+
+  test("test function greatest") {
+    withTable("t1") {
+      sql(
+        "create table t1 using parquet as select 1 as c1, 2 as c2, 'a' as c3, 'b' as c4, 'c' as c5")
+
+      val longMax = Long.MaxValue
+      val longMin = Long.MinValue
+      val dateStringMin = "2015-01-01 08:00:00"
+      val dateStringMax = "2015-01-01 11:00:00"
+      var format = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+      val dateTimeStampMin = format.parse(dateStringMin).getTime
+      val dateTimeStampMax = format.parse(dateStringMax).getTime
+      format = new SimpleDateFormat("yyyy-MM-dd")
+
+      val functions =
+        s"""
+          |select
+          |    greatest(c3, c4, c5),
+          |    greatest(c2, c1),
+          |    greatest(c1, c2, 2),
+          |    greatest(c4, c5, c3, 'ccc'),
+          |    greatest(null, null),
+          |    greatest(c3, c4, c5, null),
+          |    greatest((-1.0), 2.5),
+          |    greatest((-1), 2),
+          |    greatest(CAST(-1.0 AS FLOAT), CAST(2.5 AS FLOAT)),
+          |    greatest(${longMax}, ${longMin}),
+          |    greatest(cast(1 as byte), cast(2 as byte)),
+          |    greatest(cast(1 as short), cast(2 as short)),
+          |    greatest("abc", "aaaa"),
+          |    greatest(true, false),
+          |    greatest(
+          |        cast("2015-01-01" as date),
+          |        cast("2015-07-01" as date)
+          |    ),
+          |    greatest(
+          |        ${dateTimeStampMin},
+          |        ${dateTimeStampMax}
+          |    )
+          |from
+          |    t1
+        """.stripMargin
+
+      checkSparkAnswerAndOperator(functions)
+    }
+  }
+
+  test("test function FindInSet") {
+    withTable("t1") {
+      sql(
+        "create table t1_find_in_set using parquet as select 'ab' as a, 'b' as b, '' as c, 'def' as d")
+
+      val functions =
+        """
+          |select
+          |   find_in_set(a, 'ab'),
+          |   find_in_set(b, 'a,b'),
+          |   find_in_set(a, 'abc,b,ab,c,def'),
+          |   find_in_set(a, 'ab,abc,b,ab,c,def'),
+          |   find_in_set(a, ',,,ab,abc,b,ab,c,def'),
+          |   find_in_set(c, ',ab,abc,b,ab,c,def'),
+          |   find_in_set(a, '数据砖头,abc,b,ab,c,def'),
+          |   find_in_set(d, '数据砖头,abc,b,ab,c,def'),
+          |   find_in_set(d, null)
+          |from t1_find_in_set
+        """.stripMargin
+
+      checkSparkAnswerAndOperator(functions)
+    }
+  }
+
+  test("test function IsNaN") {
+    withTable("t1") {
+      sql("""
+          |create table test_is_nan using parquet as select
+          |  cast('NaN' as double) as c1,
+          |  cast('NaN' as float) as c2,
+          |  cast(null as double) as c3,
+          |  cast(null as double) as c4,
+          |  cast(5.5 as float) as c5,
+          |  cast(null as float) as c6
+          |""".stripMargin)
+      val functions =
+        """
+          |select
+          |    isnan(c1),
+          |    isnan(c2),
+          |    isnan(c3),
+          |    isnan(c4),
+          |    isnan(c5),
+          |    isnan(c6)
+          |from
+          |    test_is_nan
+        """.stripMargin
+
+      checkSparkAnswerAndOperator(functions)
+    }
+  }
+
+  test("test function nvl2") {
+    withTable("t1") {
+      sql(s"""CREATE TABLE t1 USING PARQUET AS SELECT
+             |'X'                      AS str_val,
+             |100                      AS int_val,
+             |array(1,2,3)             AS arr_val,
+             |CAST(NULL AS STRING)     AS null_str,
+             |CAST(NULL AS INT)        AS null_int
+             |""".stripMargin)
+
+      val sqlStr = s"""SELECT
+                      |nvl2(null_int, int_val, 999)          AS int_only,
+                      |nvl2(1,  str_val, cast(int_val AS STRING))            AS has_str,
+                      |nvl2(null_int, cast(int_val AS STRING), str_val)      AS str_in_false,
+                      |nvl2(1,  arr_val, array(888))         AS has_array,
+                      |nvl2(null_int, null_str,  null_str)   AS all_null
+                      |FROM  t1""".stripMargin
+
+      checkSparkAnswerAndOperator(sqlStr)
+    }
+  }
+
+  test("test function nvl") {
+    withTable("t1") {
+      sql(
+        "create table t1 using parquet as select 'base'" +
+          " as base, 3 as exponent")
+      val functions =
+        """
+          |select
+          |  nvl(null, base), base, nvl(4, exponent)
+          |from t1
+                    """.stripMargin
+
+      checkSparkAnswerAndOperator(functions)
+    }
+  }
+
+  test("test function Levenshtein") {
+    withTable("t1") {
+      sql(
+        "create table test_levenshtein using parquet as select '' as a, 'abc' as b, 'kitten' as c, 'frog' as d, '千世' as i, '世界千世' as j")
+      val functions =
+        """
+          |select
+          |   levenshtein(null, a),
+          |   levenshtein(a, null),
+          |   levenshtein(a, a),
+          |   levenshtein(b, b),
+          |   levenshtein(c, 'sitting'),
+          |   levenshtein(d, 'fog'),
+          |   levenshtein(i, 'fog'),
+          |   levenshtein(j, '大a界b')
+          |from test_levenshtein
+        """.stripMargin
+
+      checkSparkAnswerAndOperator(functions)
+    }
+  }
+
+  test("upper and lower functions") {
+    withSQLConf() {
+      withTable("t1") {
+        sql(s"CREATE TABLE t1(id INT, name STRING) USING parquet")
+        sql(s"""
+             |INSERT INTO t1 VALUES
+             | (1, 'fooBar'),
+             | (2, 'foo Bar foo-bar FOO-BAR foO-barR'),
+             | (3, 'straße'),
+             | (4, 'CAFÉ'),
+             | (5, '世界'),
+             | (6, '世 界'),
+             | (7, ''),
+             | (8, NULL)
+            """.stripMargin)
+
+        checkSparkAnswerAndOperator(
+          s"SELECT id, name, UPPER(name) AS up, LOWER(name) AS low FROM t1")
+      }
+    }
+  }
+
+  test("bround function with varying scales for doublePi") {
+    withTable("t1") {
+      val doublePi: Double = math.Pi
+      sql(s"CREATE TABLE t1(c1 DOUBLE) USING parquet")
+      sql(s"INSERT INTO t1 VALUES($doublePi)")
+
+      val scales = -6 to 6
+      val expectedResults = Map(
+        -6 -> 0.0,
+        -5 -> 0.0,
+        -4 -> 0.0,
+        -3 -> 0.0,
+        -2 -> 0.0,
+        -1 -> 0.0,
+        0 -> 3.0,
+        1 -> 3.1,
+        2 -> 3.14,
+        3 -> 3.142,
+        4 -> 3.1416,
+        5 -> 3.14159,
+        6 -> 3.141593)
+
+      scales.foreach { scale =>
+        val df = sql(s"SELECT bround(c1, $scale) FROM t1")
+        val expected = expectedResults(scale)
+        checkAnswer(df, Seq(Row(expected)))
+      }
+    }
+  }
+
+  test("bround function with varying scales for floatPi") {
+    withTable("t1") {
+      val floatPi: Float = 3.1415f
+      sql(s"CREATE TABLE t1(c1 FLOAT) USING parquet")
+      sql(s"INSERT INTO t1 VALUES($floatPi)")
+
+      val scales = -6 to 6
+      val expectedResults = Map(
+        -6 -> 0.0f,
+        -5 -> 0.0f,
+        -4 -> 0.0f,
+        -3 -> 0.0f,
+        -2 -> 0.0f,
+        -1 -> 0.0f,
+        0 -> 3.0f,
+        1 -> 3.1f,
+        2 -> 3.14f,
+        3 -> 3.142f,
+        4 -> 3.1415f,
+        5 -> 3.1415f,
+        6 -> 3.1415f)
+
+      scales.foreach { scale =>
+        val df = sql(s"SELECT bround(c1, $scale) FROM t1")
+        val expected = expectedResults(scale)
+        checkAnswer(df, Seq(Row(expected)))
+      }
+    }
+  }
+
+  test("bround function with varying scales for shortPi") {
+    withTable("t1") {
+      val shortPi: Short = 31415
+      sql(s"CREATE TABLE t1(c1 SMALLINT) USING parquet")
+      sql(s"INSERT INTO t1 VALUES($shortPi)")
+
+      val scales = -6 to 6
+      val expectedResults = Map(
+        -6 -> 0.toShort,
+        -5 -> 0.toShort,
+        -4 -> 30000.toShort,
+        -3 -> 31000.toShort,
+        -2 -> 31400.toShort,
+        -1 -> 31420.toShort,
+        0 -> 31415.toShort,
+        1 -> 31415.toShort,
+        2 -> 31415.toShort,
+        3 -> 31415.toShort,
+        4 -> 31415.toShort,
+        5 -> 31415.toShort,
+        6 -> 31415.toShort)
+
+      scales.foreach { scale =>
+        val df = sql(s"SELECT bround(c1, $scale) FROM t1")
+        val expected = expectedResults(scale)
+        checkAnswer(df, Seq(Row(expected)))
+      }
+    }
+  }
+
+  test("bround function with varying scales for intPi") {
+    withTable("t1") {
+      val intPi: Int = 314159265
+      sql(s"CREATE TABLE t1(c1 INT) USING parquet")
+      sql(s"INSERT INTO t1 VALUES($intPi)")
+
+      val scales = -6 to 6
+      val expectedResults = Map(
+        -6 -> 314000000,
+        -5 -> 314200000,
+        -4 -> 314160000,
+        -3 -> 314159000,
+        -2 -> 314159300,
+        -1 -> 314159260,
+        0 -> 314159265,
+        1 -> 314159265,
+        2 -> 314159265,
+        3 -> 314159265,
+        4 -> 314159265,
+        5 -> 314159265,
+        6 -> 314159265)
+
+      scales.foreach { scale =>
+        val df = sql(s"SELECT bround(c1, $scale) FROM t1")
+        val expected = expectedResults(scale)
+        checkAnswer(df, Seq(Row(expected)))
+      }
+    }
+  }
+
+  test("bround function with varying scales for longPi") {
+    withTable("t1") {
+      val longPi: Long = 31415926535897932L
+      sql(s"CREATE TABLE t1(c1 BIGINT) USING parquet")
+      sql(s"INSERT INTO t1 VALUES($longPi)")
+
+      val scales = -6 to 6
+      val expectedResults = Map(
+        -6 -> 31415926536000000L,
+        -5 -> 31415926535900000L,
+        -4 -> 31415926535900000L,
+        -3 -> 31415926535898000L,
+        -2 -> 31415926535897900L,
+        -1 -> 31415926535897930L,
+        0 -> 31415926535897932L,
+        1 -> 31415926535897932L,
+        2 -> 31415926535897932L,
+        3 -> 31415926535897932L,
+        4 -> 31415926535897932L,
+        5 -> 31415926535897932L,
+        6 -> 31415926535897932L)
+
+      scales.foreach { scale =>
+        val df = sql(s"SELECT bround(c1, $scale) FROM t1")
+        val expected = expectedResults(scale)
+        checkAnswer(df, Seq(Row(expected)))
+      }
+    }
+  }
+
+  test("bround function for null values") {
+    withTable("t1") {
+      sql("CREATE TABLE t1(c1 DOUBLE) USING parquet")
+      sql("INSERT INTO t1 VALUES(NULL)")
+
+      val scales = -6 to 6
+      scales.foreach { scale =>
+        val df = sql(s"SELECT bround(c1, $scale) FROM t1")
+        checkAnswer(df, Seq(Row(null)))
+      }
+    }
+  }
+
+  test("randn function with seed") {
+    withTable("t1") {
+      sql("CREATE TABLE t1(id INT) USING parquet")
+      sql("INSERT INTO t1 VALUES(1), (2), (3)")
+
+      // randn is non-deterministic and intentionally does not replicate Spark's RNG, so its
+      // values cannot be compared against vanilla Spark. Verify it runs natively, produces a
+      // non-null value per row, and is reproducible for a fixed seed.
+      val query = "SELECT id, randn(42) AS r1, randn(100) AS r2 FROM t1 ORDER BY id"
+      val df = sql(query)
+      val rows = df.collect()
+      assertPlanIsNative(df)
+
+      assert(rows.length == 3)
+      assert(rows.forall(r => !r.isNullAt(1) && !r.isNullAt(2)))
+
+      // Same seed -> same values across executions.
+      val rows2 = sql(query).collect()
+      assert(rows.map(_.getDouble(1)).sameElements(rows2.map(_.getDouble(1))))
+      assert(rows.map(_.getDouble(2)).sameElements(rows2.map(_.getDouble(2))))
+
+      // Different seeds -> different values.
+      assert(rows.exists(r => r.getDouble(1) != r.getDouble(2)))
+    }
+  }
+
+  test("randn function with foldable seed expression") {
+    withTable("t1") {
+      sql("CREATE TABLE t1(id INT) USING parquet")
+      sql("INSERT INTO t1 VALUES(1), (2), (3)")
+
+      // A foldable (non-literal) seed must still be converted to the native randn expression.
+      val query = "SELECT id, randn(cast(42 as bigint)) AS r FROM t1 ORDER BY id"
+      val df = sql(query)
+      val rows = df.collect()
+      assertPlanIsNative(df)
+
+      assert(rows.length == 3)
+      assert(rows.forall(r => !r.isNullAt(1)))
+
+      // Reproducible for a fixed seed.
+      val rows2 = sql(query).collect()
+      assert(rows.map(_.getDouble(1)).sameElements(rows2.map(_.getDouble(1))))
+    }
+  }
+
+  test("randn function without seed") {
+    withTable("t1") {
+      sql("CREATE TABLE t1(id INT) USING parquet")
+      sql("INSERT INTO t1 VALUES(1), (2), (3)")
+
+      // randn() with no seed uses a randomly assigned seed, so values are not reproducible
+      // across executions. Verify it still runs natively and produces a non-null value per row.
+      val df = sql("SELECT id, randn() AS r FROM t1 ORDER BY id")
+      val rows = df.collect()
+      assertPlanIsNative(df)
+
+      assert(rows.length == 3)
+      assert(rows.forall(r => !r.isNullAt(1)))
+    }
+  }
+
+  test("ascii function") {
+    withTable("t1") {
+      sql("create table t1(c1 string) using parquet")
+      sql("insert into t1 values('A'), ('abc'), (''), (null)")
+      checkSparkAnswerAndOperator("select ascii(c1) from t1")
+    }
+  }
+
+  test("bit_length function") {
+    withTable("t1") {
+      sql("create table t1(c1 string) using parquet")
+      sql("insert into t1 values('hello'), (''), (null), ('caf\\u00e9')")
+      checkSparkAnswerAndOperator("select bit_length(c1) from t1")
+    }
+  }
+
+  test("chr function") {
+    withTable("t1") {
+      sql("create table t1(c1 bigint) using parquet")
+      sql("insert into t1 values(65), (97), (48), (null)")
+      checkSparkAnswerAndOperator("select chr(c1) from t1")
+    }
+  }
+
+  test("translate function") {
+    withTable("t1") {
+      sql("create table t1(c1 string) using parquet")
+      sql("insert into t1 values('AaBbCc'), ('hello'), (''), (null)")
+      checkSparkAnswerAndOperator("select translate(c1, 'ABC', 'xyz') from t1")
+    }
+  }
+
+  test("replace function") {
+    withTable("t1") {
+      sql("create table t1(c1 string) using parquet")
+      sql("insert into t1 values('hello world'), ('aaa'), (''), (null)")
+      checkSparkAnswerAndOperator("select replace(c1, 'world', 'spark') from t1")
+      checkSparkAnswerAndOperator("select replace(c1, 'a', '') from t1")
+    }
+  }
+
+  test("date_trunc function") {
+    withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC") {
+      withTable("t1") {
+        sql("create table t1(c1 timestamp) using parquet")
+        sql("""insert into t1 values
+            |  (timestamp'2024-03-15 14:30:45'),
+            |  (timestamp'2024-12-31 23:59:59'),
+            |  (null)
+            |""".stripMargin)
+        checkSparkAnswerAndOperator("select date_trunc('year', c1) from t1")
+        checkSparkAnswerAndOperator("select date_trunc('month', c1) from t1")
+        checkSparkAnswerAndOperator("select date_trunc('day', c1) from t1")
+        checkSparkAnswerAndOperator("select date_trunc('hour', c1) from t1")
+      }
+    }
+  }
+
+  test("test function make_date") {
+    withSQLConf("spark.sql.ansi.enabled" -> "false") {
+      withTable("t1") {
+        sql("create table t1(year int, month int, day int) using parquet")
+        sql("""
+            |insert into t1 values
+            |  (2025, 3, 1),
+            |  (2024, null, 2),
+            |  (2024, 2, 30),
+            |  (null, 7, 15),
+            |  (2024, 7, null)
+            |""".stripMargin)
+        checkSparkAnswerAndOperator(
+          "select make_date(year, month, day), " +
+            "make_date(cast(null as int), month, day) from t1")
+      }
+    }
+  }
+
+  test("make_date invalid input follows version-specific ANSI behavior") {
+    withSQLConf("spark.sql.ansi.enabled" -> "true") {
+      withTable("t1") {
+        sql("create table t1(year int, month int, day int) using parquet")
+        sql("insert into t1 values (2024, 13, 1)")
+        val query = "select make_date(year, month, day) from t1"
+
+        if (AuronTestUtils.isSparkV31OrGreater) {
+          val df = sql(query)
+          val err = intercept[Exception] {
+            df.collect()
+          }
+          assertPlanIsNative(df)
+          assert(allCauseMessages(err).toLowerCase.contains("invalid value for make_date"))
+        } else {
+          checkSparkAnswerAndOperator(query)
+        }
+      }
+    }
+  }
+
+  test("months_between function") {
+    withSQLConf("spark.sql.session.timeZone" -> "UTC") {
+      withTable("t1") {
+        sql("""
+              |create table t1(
+              |  same_day_of_month_later_ts timestamp,
+              |  same_day_of_month_earlier_ts timestamp,
+              |  last_day_of_month_later_dt date,
+              |  last_day_of_month_earlier_dt date,
+              |  fractional_later_ts timestamp,
+              |  fractional_earlier_ts timestamp,
+              |  null_ts timestamp
+              |) using parquet
+              |""".stripMargin)
+        sql("""
+              |insert into t1 values (
+              |  timestamp'2024-03-15 23:59:59',
+              |  timestamp'2024-01-15 00:00:00',
+              |  date'2024-02-29',
+              |  date'2024-01-31',
+              |  timestamp'2024-03-02 12:00:00',
+              |  timestamp'2024-01-01 00:00:00',
+              |  null
+              |)
+              |""".stripMargin)
+        val query =
+          """
+              |select
+              |  months_between(same_day_of_month_later_ts, same_day_of_month_earlier_ts)
+              |    as same_day_of_month_ignores_time_positive,
+              |  months_between(last_day_of_month_later_dt, last_day_of_month_earlier_dt)
+              |    as last_day_of_month_ignores_time,
+              |  months_between(fractional_later_ts, fractional_earlier_ts)
+              |    as rounded_fractional_positive,
+              |  months_between(same_day_of_month_earlier_ts, same_day_of_month_later_ts)
+              |    as same_day_of_month_ignores_time_negative,
+              |  months_between(fractional_earlier_ts, fractional_later_ts)
+              |    as rounded_fractional_negative,
+              |  months_between(fractional_later_ts, fractional_earlier_ts, false)
+              |    as unrounded_fractional_positive,
+              |  months_between(null_ts, fractional_earlier_ts)
+              |    as null_propagation
+              |from t1
+              |""".stripMargin
+        checkSparkAnswerAndOperator(query)
+      }
+    }
+  }
+}

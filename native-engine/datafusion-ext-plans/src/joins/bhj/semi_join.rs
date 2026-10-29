@@ -1,0 +1,434 @@
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::{
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering::Relaxed},
+    },
+};
+
+use arrow::{
+    array::{ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions},
+    buffer::NullBuffer,
+};
+use async_trait::async_trait;
+use bitvec::{bitvec, prelude::BitVec};
+use datafusion::{common::Result, physical_plan::metrics::Time};
+use datafusion_ext_commons::{
+    arrow::{eq_comparator::EqComparator, selection::take_cols},
+    likely,
+};
+
+use crate::{
+    broadcast_join_exec::Joiner,
+    common::{execution_context::WrappedRecordBatchSender, timer_helper::TimerHelper},
+    joins::{
+        JoinParams,
+        bhj::{
+            ProbeSide, filter_cols,
+            semi_join::{
+                ProbeSide::{L, R},
+                SemiMode::{Anti, Existence, Semi},
+            },
+        },
+        join_hash_map::{JoinHashMap, join_create_hashes},
+    },
+};
+
+#[derive(std::marker::ConstParamTy, Clone, Copy, PartialEq, Eq)]
+pub enum SemiMode {
+    Semi,
+    Anti,
+    Existence,
+}
+
+#[derive(std::marker::ConstParamTy, Clone, Copy, PartialEq, Eq)]
+pub struct JoinerParams {
+    probe_side: ProbeSide,
+    probe_is_join_side: bool,
+    mode: SemiMode,
+}
+
+impl JoinerParams {
+    const fn new(probe_side: ProbeSide, probe_is_join_side: bool, mode: SemiMode) -> Self {
+        Self {
+            probe_side,
+            probe_is_join_side,
+            mode,
+        }
+    }
+}
+
+const LEFT_PROBED_LEFT_SEMI: JoinerParams = JoinerParams::new(L, true, Semi);
+const LEFT_PROBED_LEFT_ANTI: JoinerParams = JoinerParams::new(L, true, Anti);
+const LEFT_PROBED_RIGHT_SEMI: JoinerParams = JoinerParams::new(L, false, Semi);
+const LEFT_PROBED_RIGHT_ANTI: JoinerParams = JoinerParams::new(L, false, Anti);
+const LEFT_PROBED_EXISTENCE: JoinerParams = JoinerParams::new(L, true, Existence);
+const RIGHT_PROBED_LEFT_SEMI: JoinerParams = JoinerParams::new(R, false, Semi);
+const RIGHT_PROBED_LEFT_ANTI: JoinerParams = JoinerParams::new(R, false, Anti);
+const RIGHT_PROBED_RIGHT_SEMI: JoinerParams = JoinerParams::new(R, true, Semi);
+const RIGHT_PROBED_RIGHT_ANTI: JoinerParams = JoinerParams::new(R, true, Anti);
+const RIGHT_PROBED_EXISTENCE: JoinerParams = JoinerParams::new(R, false, Existence);
+
+pub type LProbedLeftSemiJoiner = SemiJoiner<LEFT_PROBED_LEFT_SEMI>;
+pub type LProbedLeftAntiJoiner = SemiJoiner<LEFT_PROBED_LEFT_ANTI>;
+pub type LProbedRightSemiJoiner = SemiJoiner<LEFT_PROBED_RIGHT_SEMI>;
+pub type LProbedRightAntiJoiner = SemiJoiner<LEFT_PROBED_RIGHT_ANTI>;
+pub type LProbedExistenceJoiner = SemiJoiner<LEFT_PROBED_EXISTENCE>;
+pub type RProbedLeftSemiJoiner = SemiJoiner<RIGHT_PROBED_LEFT_SEMI>;
+pub type RProbedLeftAntiJoiner = SemiJoiner<RIGHT_PROBED_LEFT_ANTI>;
+pub type RProbedRightSemiJoiner = SemiJoiner<RIGHT_PROBED_RIGHT_SEMI>;
+pub type RProbedRightAntiJoiner = SemiJoiner<RIGHT_PROBED_RIGHT_ANTI>;
+pub type RProbedExistenceJoiner = SemiJoiner<RIGHT_PROBED_EXISTENCE>;
+
+pub struct SemiJoiner<const P: JoinerParams> {
+    join_params: JoinParams,
+    output_sender: Arc<WrappedRecordBatchSender>,
+    map_joined: BitVec,
+    map: Arc<JoinHashMap>,
+    output_rows: AtomicUsize,
+}
+
+impl<const P: JoinerParams> SemiJoiner<P> {
+    pub fn new(
+        join_params: JoinParams,
+        map: Arc<JoinHashMap>,
+        output_sender: Arc<WrappedRecordBatchSender>,
+    ) -> Self {
+        let map_joined = bitvec![0; map.data_batch().num_rows()];
+        Self {
+            join_params,
+            output_sender,
+            map,
+            map_joined,
+            output_rows: AtomicUsize::new(0),
+        }
+    }
+
+    fn create_probed_key_columns(&self, probed_batch: &RecordBatch) -> Result<Vec<ArrayRef>> {
+        let probed_key_exprs = match P.probe_side {
+            L => &self.join_params.left_keys,
+            R => &self.join_params.right_keys,
+        };
+        let probed_key_columns: Vec<ArrayRef> = probed_key_exprs
+            .iter()
+            .map(|expr| {
+                Ok(expr
+                    .evaluate(probed_batch)?
+                    .into_array(probed_batch.num_rows())?)
+            })
+            .collect::<Result<_>>()?;
+        Ok(probed_key_columns)
+    }
+
+    /// Accumulate match bits across candidate chunks, including chunks that
+    /// split a row.
+    fn filter_joined(
+        &self,
+        probed_batch: &RecordBatch,
+        probe_indices: &mut Vec<u32>,
+        build_indices: &mut Vec<u32>,
+        probed_joined: &mut BitVec,
+        map_joined: &mut BitVec,
+    ) -> Result<()> {
+        if probe_indices.is_empty() {
+            return Ok(());
+        }
+        let Some(filter) = &self.join_params.residual_filter else {
+            return Ok(());
+        };
+        let cols = filter_cols(
+            filter,
+            P.probe_side,
+            probed_batch,
+            self.map.data_batch(),
+            probe_indices,
+            build_indices,
+        )?;
+        for i in filter.apply_rows(cols, probe_indices.len())? {
+            if P.probe_is_join_side {
+                probed_joined.set(probe_indices[i as usize] as usize, true);
+            } else {
+                map_joined.set(build_indices[i as usize] as usize, true);
+            }
+        }
+        probe_indices.clear();
+        build_indices.clear();
+        Ok(())
+    }
+
+    async fn flush(&self, cols: Vec<ArrayRef>, num_rows: usize) -> Result<()> {
+        let output_batch = RecordBatch::try_new_with_options(
+            self.join_params.projection.schema.clone(),
+            cols,
+            &RecordBatchOptions::new().with_row_count(Some(num_rows)),
+        )?;
+        self.output_rows.fetch_add(output_batch.num_rows(), Relaxed);
+        self.output_sender.send(output_batch).await;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<const P: JoinerParams> Joiner for SemiJoiner<P> {
+    async fn join(
+        mut self: Pin<&mut Self>,
+        probed_batch: RecordBatch,
+        probed_side_hash_time: &Time,
+        probed_side_search_time: &Time,
+        probed_side_compare_time: &Time,
+        build_output_time: &Time,
+    ) -> Result<()> {
+        let mut probed_joined = bitvec![0; probed_batch.num_rows()];
+        let map_joined = unsafe {
+            // safety: ignore r/w conflicts with self.map
+            std::mem::transmute::<_, &mut BitVec>(&mut self.map_joined)
+        };
+
+        let probed_key_columns = self.create_probed_key_columns(&probed_batch)?;
+        let probed_hashes = probed_side_hash_time
+            .with_timer(|| join_create_hashes(probed_batch.num_rows(), &probed_key_columns));
+
+        let map = self.map.clone();
+        let eq = EqComparator::try_new(&probed_key_columns, map.key_columns())?;
+
+        let probed_valids = probed_key_columns
+            .iter()
+            .map(|col| col.logical_nulls())
+            .reduce(|nb1, nb2| NullBuffer::union(nb1.as_ref(), nb2.as_ref()))
+            .flatten();
+
+        let map_values = probed_side_search_time.with_timer(|| {
+            let probed_hashes = if let Some(probed_valids) = &probed_valids {
+                probed_hashes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(row_idx, &hash)| probed_valids.is_valid(row_idx).then_some(hash))
+                    .collect()
+            } else {
+                probed_hashes
+            };
+            map.lookup_many(probed_hashes)
+        });
+
+        let _probed_side_compare_timer = probed_side_compare_time.timer();
+        let mut hashes_idx = 0;
+
+        let has_filter = self.join_params.residual_filter.is_some();
+        let batch_size = self.join_params.batch_size.max(1);
+        let (mut probe_indices, mut build_indices): (Vec<u32>, Vec<u32>) = (vec![], vec![]);
+
+        // Whether the build side contains any NULL join keys
+        let build_has_null_keys = if map.data_batch().num_rows() == 0 {
+            false
+        } else {
+            map.key_columns().iter().any(|col| col.null_count() > 0)
+        };
+
+        for row_idx in 0..probed_batch.num_rows() {
+            let key_is_valid = probed_valids
+                .as_ref()
+                .map(|nb| nb.is_valid(row_idx))
+                .unwrap_or(true);
+            if P.mode == Anti
+                && P.probe_is_join_side
+                && (!key_is_valid || build_has_null_keys) // Filter if probe row is NULL or build side has any NULL
+                && self.join_params.is_null_aware_anti_join
+            {
+                probed_joined.set(row_idx, true);
+                continue;
+            }
+            if key_is_valid {
+                let map_value = map_values[hashes_idx];
+                hashes_idx += 1;
+
+                if has_filter {
+                    let single = [map_value.get_single()];
+                    let candidates = if map_value.is_single() {
+                        single.as_slice()
+                    } else if map_value.is_range() {
+                        map.get_range(map_value)
+                    } else {
+                        &[]
+                    };
+                    for &map_idx in candidates {
+                        if P.probe_is_join_side && probed_joined[row_idx] {
+                            break;
+                        }
+                        if likely!(eq.eq(row_idx, map_idx as usize)) {
+                            probe_indices.push(row_idx as u32);
+                            build_indices.push(map_idx);
+                        }
+                        if probe_indices.len() >= batch_size {
+                            self.filter_joined(
+                                &probed_batch,
+                                &mut probe_indices,
+                                &mut build_indices,
+                                &mut probed_joined,
+                                map_joined,
+                            )?;
+                        }
+                    }
+                    continue;
+                }
+
+                match map_value {
+                    map_value if map_value.is_single() => {
+                        let map_idx = map_value.get_single();
+                        if likely!(eq.eq(row_idx, map_idx as usize)) {
+                            if P.probe_is_join_side {
+                                probed_joined.set(row_idx, true);
+                            } else {
+                                map_joined.set(map_idx as usize, true);
+                            }
+                        }
+                    }
+                    map_value if map_value.is_range() => {
+                        let range = map.get_range(map_value);
+                        let mut eqs = range
+                            .iter()
+                            .filter(|&map_idx| likely!(eq.eq(row_idx, *map_idx as usize)));
+
+                        if let Some(&map_idx) = eqs.next() {
+                            if P.probe_is_join_side {
+                                probed_joined.set(row_idx, true);
+                            } else if !map_joined[map_idx as usize] {
+                                map_joined.set(map_idx as usize, true);
+                                for &map_idx in eqs {
+                                    map_joined.set(map_idx as usize, true);
+                                }
+                                // otherwise all map records with this key
+                                // should
+                                // have already been joined
+                            }
+                        }
+                    }
+                    _ => {} // map_value.is_empty()
+                }
+            }
+        }
+
+        self.filter_joined(
+            &probed_batch,
+            &mut probe_indices,
+            &mut build_indices,
+            &mut probed_joined,
+            map_joined,
+        )?;
+
+        if P.probe_is_join_side {
+            probed_side_compare_time
+                .exclude_timer_async(async {
+                    let _build_output_timer = build_output_time.timer();
+                    let pprojected = match P.probe_side {
+                        L => self
+                            .join_params
+                            .projection
+                            .project_left(probed_batch.columns()),
+                        R => self
+                            .join_params
+                            .projection
+                            .project_right(probed_batch.columns()),
+                    };
+                    let (pcols, num_rows) = match P.mode {
+                        Semi | Anti => {
+                            let probed_indices = probed_joined
+                                .into_iter()
+                                .enumerate()
+                                .filter(|(_, joined)| (P.mode == Semi) ^ !joined)
+                                .map(|(idx, _)| idx as u32)
+                                .collect::<Vec<_>>();
+                            let num_rows = probed_indices.len();
+                            (take_cols(&pprojected, probed_indices)?, num_rows)
+                        }
+                        Existence => {
+                            let num_rows = probed_joined.len();
+                            let exists_col = Arc::new(BooleanArray::from(
+                                probed_joined.into_iter().collect::<Vec<_>>(),
+                            ));
+                            let mut cols = pprojected;
+                            if let Some(pos) = self.join_params.projection.existence_output {
+                                cols.insert(pos, exists_col);
+                            }
+                            (cols, num_rows)
+                        }
+                    };
+                    build_output_time
+                        .exclude_timer_async(self.as_mut().flush(pcols, num_rows))
+                        .await
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn finish(mut self: Pin<&mut Self>, build_output_time: &Time) -> Result<()> {
+        if !P.probe_is_join_side {
+            let _build_output_timer = build_output_time.timer();
+            let mprojected = match P.probe_side {
+                L => self
+                    .join_params
+                    .projection
+                    .project_right(self.map.data_batch().columns()),
+                R => self
+                    .join_params
+                    .projection
+                    .project_left(self.map.data_batch().columns()),
+            };
+            let map_joined = std::mem::take(&mut self.map_joined);
+            let (pcols, num_rows) = match P.mode {
+                Semi | Anti => {
+                    let map_indices = map_joined
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(_, joined)| (P.mode == Semi) ^ !joined)
+                        .map(|(idx, _)| idx as u32)
+                        .collect::<Vec<_>>();
+                    let num_rows = map_indices.len();
+                    (take_cols(&mprojected, map_indices)?, num_rows)
+                }
+                Existence => {
+                    let num_rows = map_joined.len();
+                    let exists_col = Arc::new(BooleanArray::from(
+                        map_joined.into_iter().collect::<Vec<_>>(),
+                    ));
+                    let mut cols = mprojected;
+                    if let Some(pos) = self.join_params.projection.existence_output {
+                        cols.insert(pos, exists_col);
+                    }
+                    (cols, num_rows)
+                }
+            };
+            build_output_time
+                .exclude_timer_async(self.as_mut().flush(pcols, num_rows))
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn can_early_stop(&self) -> bool {
+        if !P.probe_is_join_side && self.map_joined.all() {
+            // semi join: map is join side and all items are joined
+            return true;
+        }
+        false
+    }
+
+    fn num_output_rows(&self) -> usize {
+        self.output_rows.load(Relaxed)
+    }
+}

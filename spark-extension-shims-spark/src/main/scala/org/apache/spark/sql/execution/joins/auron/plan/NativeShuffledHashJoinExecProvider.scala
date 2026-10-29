@@ -1,0 +1,234 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.spark.sql.execution.joins.auron.plan
+
+import scala.annotation.nowarn
+
+import org.apache.spark.sql.auron.join.JoinBuildSides.JoinBuildSide
+import org.apache.spark.sql.catalyst.expressions.Expression
+import org.apache.spark.sql.catalyst.plans.JoinType
+import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.execution.auron.plan.NativeShuffledHashJoinBase
+import org.apache.spark.sql.execution.joins.HashJoin
+
+import org.apache.auron.sparkver
+
+case object NativeShuffledHashJoinExecProvider {
+
+  @sparkver("3.2 / 3.3 / 3.4 / 3.5 / 4.0 / 4.1 / 4.2")
+  def provide(
+      left: SparkPlan,
+      right: SparkPlan,
+      leftKeys: Seq[Expression],
+      rightKeys: Seq[Expression],
+      joinType: JoinType,
+      condition: Option[Expression],
+      buildSide: JoinBuildSide,
+      isSkewJoin: Boolean): NativeShuffledHashJoinBase = {
+
+    import org.apache.spark.rdd.RDD
+    import org.apache.spark.sql.catalyst.InternalRow
+    import org.apache.spark.sql.catalyst.expressions.codegen.CodegenContext
+
+    case class NativeShuffledHashJoinExec(
+        override val left: SparkPlan,
+        override val right: SparkPlan,
+        override val leftKeys: Seq[Expression],
+        override val rightKeys: Seq[Expression],
+        override val joinType: JoinType,
+        override val condition: Option[Expression],
+        buildSide: JoinBuildSide,
+        skewJoin: Boolean)
+        extends NativeShuffledHashJoinBase(
+          left,
+          right,
+          leftKeys,
+          rightKeys,
+          joinType,
+          condition,
+          buildSide)
+        with org.apache.spark.sql.execution.joins.ShuffledJoin {
+
+      override def isSkewJoin: Boolean = false
+
+      override def supportCodegen: Boolean = false
+
+      override def rewriteKeyExprToLong(exprs: Seq[Expression]): Seq[Expression] =
+        HashJoin.rewriteKeyExpr(exprs)
+
+      override def inputRDDs(): Seq[RDD[InternalRow]] = {
+        throw new NotImplementedError("NativeShuffledHash dose not support codegen")
+      }
+
+      override protected def doProduce(ctx: CodegenContext): String = {
+        throw new NotImplementedError("NativeShuffledHash dose not support codegen")
+      }
+
+      override protected def withNewChildrenInternal(
+          newLeft: SparkPlan,
+          newRight: SparkPlan): SparkPlan =
+        copy(left = newLeft, right = newRight)
+
+      override def nodeName: String =
+        "NativeShuffledHashJoin" + (if (skewJoin) "(skew=true)" else "")
+    }
+    NativeShuffledHashJoinExec(
+      left,
+      right,
+      leftKeys,
+      rightKeys,
+      joinType,
+      condition,
+      buildSide,
+      isSkewJoin)
+  }
+
+  @nowarn("cat=unused") // Some params temporarily unused
+  @sparkver("3.1")
+  def provide(
+      left: SparkPlan,
+      right: SparkPlan,
+      leftKeys: Seq[Expression],
+      rightKeys: Seq[Expression],
+      joinType: JoinType,
+      condition: Option[Expression],
+      buildSide: JoinBuildSide,
+      isSkewJoin: Boolean): NativeShuffledHashJoinBase = {
+
+    import org.apache.spark.sql.auron.join.JoinBuildSides.{JoinBuildLeft, JoinBuildRight}
+    import org.apache.spark.sql.catalyst.expressions.SortOrder
+    import org.apache.spark.sql.execution.joins.ShuffledHashJoinExec
+
+    case class NativeShuffledHashJoinExec(
+        override val left: SparkPlan,
+        override val right: SparkPlan,
+        leftKeys: Seq[Expression],
+        rightKeys: Seq[Expression],
+        joinType: JoinType,
+        override val condition: Option[Expression],
+        buildSide: JoinBuildSide)
+        extends NativeShuffledHashJoinBase(
+          left,
+          right,
+          leftKeys,
+          rightKeys,
+          joinType,
+          condition,
+          buildSide)
+        with org.apache.spark.sql.execution.joins.ShuffledJoin {
+
+      override def rewriteKeyExprToLong(exprs: Seq[Expression]): Seq[Expression] =
+        HashJoin.rewriteKeyExpr(exprs)
+
+      override def outputOrdering: Seq[SortOrder] = {
+        import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, LeftAnti, LeftOuter, LeftSemi, RightOuter}
+
+        // Spark 3.1 HashJoin rejects these build sides; native SHJ supports them without ordering.
+        (joinType, buildSide) match {
+          case (LeftOuter | LeftSemi | LeftAnti | _: ExistenceJoin, JoinBuildLeft) =>
+            return Nil
+          case (RightOuter, JoinBuildRight) => return Nil
+          case _ =>
+        }
+        val sparkBuildSide = buildSide match {
+          case JoinBuildLeft => org.apache.spark.sql.catalyst.optimizer.BuildLeft
+          case JoinBuildRight => org.apache.spark.sql.catalyst.optimizer.BuildRight
+        }
+        val shj =
+          ShuffledHashJoinExec(
+            leftKeys,
+            rightKeys,
+            joinType,
+            sparkBuildSide,
+            condition,
+            left,
+            right)
+        shj.outputOrdering
+      }
+
+      override def withNewChildren(newChildren: Seq[SparkPlan]): SparkPlan =
+        copy(left = newChildren(0), right = newChildren(1))
+
+      override def nodeName: String = "NativeShuffledHashJoin"
+    }
+    NativeShuffledHashJoinExec(left, right, leftKeys, rightKeys, joinType, condition, buildSide)
+  }
+
+  @nowarn("cat=unused") // Some params temporarily unused
+  @sparkver("3.0")
+  def provide(
+      left: SparkPlan,
+      right: SparkPlan,
+      leftKeys: Seq[Expression],
+      rightKeys: Seq[Expression],
+      joinType: JoinType,
+      condition: Option[Expression],
+      buildSide: JoinBuildSide,
+      isSkewJoin: Boolean): NativeShuffledHashJoinBase = {
+
+    import org.apache.spark.sql.auron.join.JoinBuildSides.{JoinBuildLeft, JoinBuildRight}
+    import org.apache.spark.sql.catalyst.expressions.Attribute
+    import org.apache.spark.sql.execution.joins.ShuffledHashJoinExec
+
+    case class NativeShuffledHashJoinExec(
+        override val left: SparkPlan,
+        override val right: SparkPlan,
+        leftKeys: Seq[Expression],
+        rightKeys: Seq[Expression],
+        joinType: JoinType,
+        condition: Option[Expression],
+        buildSide: JoinBuildSide)
+        extends NativeShuffledHashJoinBase(
+          left,
+          right,
+          leftKeys,
+          rightKeys,
+          joinType,
+          condition,
+          buildSide) {
+
+      private def shj: ShuffledHashJoinExec = {
+        val sparkBuildSide = buildSide match {
+          case JoinBuildLeft => org.apache.spark.sql.execution.joins.BuildLeft
+          case JoinBuildRight => org.apache.spark.sql.execution.joins.BuildRight
+        }
+        ShuffledHashJoinExec(
+          leftKeys,
+          rightKeys,
+          joinType,
+          sparkBuildSide,
+          condition,
+          left,
+          right)
+      }
+
+      override def output: Seq[Attribute] = shj.output
+
+      override def rewriteKeyExprToLong(exprs: Seq[Expression]): Seq[Expression] =
+        HashJoin.rewriteKeyExpr(exprs)
+
+      override val (outputPartitioning, outputOrdering) =
+        (shj.outputPartitioning, shj.outputOrdering)
+
+      override def withNewChildren(newChildren: Seq[SparkPlan]): SparkPlan =
+        copy(left = newChildren(0), right = newChildren(1))
+
+      override def nodeName: String = "NativeShuffledHashJoin"
+    }
+    NativeShuffledHashJoinExec(left, right, leftKeys, rightKeys, joinType, condition, buildSide)
+  }
+}

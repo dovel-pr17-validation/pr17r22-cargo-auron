@@ -1,0 +1,102 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.auron
+
+import org.apache.spark.sql.AuronQueryTest
+import org.apache.spark.sql.auron.NativeConverters
+import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Cast, GreaterThan, Literal}
+import org.apache.spark.sql.types.{BooleanType, DataType, DoubleType, FloatType, IntegerType, StringType}
+
+import org.apache.auron.protobuf.ScalarFunction
+
+class NativeConvertersSuite
+    extends AuronQueryTest
+    with BaseAuronSQLSuite
+    with AuronSQLTestHelper {
+
+  private def assertTrimmedCast(rawValue: String, targetType: DataType): Unit = {
+    val expr = Cast(Literal.create(rawValue, StringType), targetType)
+    val nativeExpr = NativeConverters.convertExpr(expr)
+
+    assert(nativeExpr.hasTryCast)
+    val childExpr = nativeExpr.getTryCast.getExpr
+    assert(childExpr.hasScalarFunction)
+    val scalarFn = childExpr.getScalarFunction
+    assert(scalarFn.getFun == ScalarFunction.Trim)
+    assert(scalarFn.getArgsCount == 1 && scalarFn.getArgs(0).hasLiteral)
+  }
+
+  private def assertNonTrimmedCast(rawValue: String, targetType: DataType): Unit = {
+    val expr = Cast(Literal.create(rawValue, StringType), targetType)
+    val nativeExpr = NativeConverters.convertExpr(expr)
+
+    assert(nativeExpr.hasTryCast)
+    val childExpr = nativeExpr.getTryCast.getExpr
+    assert(!childExpr.hasScalarFunction)
+    assert(childExpr.hasLiteral)
+  }
+
+  test("cast from string to numeric adds trim wrapper before native cast when enabled") {
+    withSQLConf("spark.auron.cast.trimString" -> "true") {
+      assertTrimmedCast(" 42 ", IntegerType)
+    }
+  }
+
+  test("cast from string to boolean adds trim wrapper before native cast when enabled") {
+    withSQLConf("spark.auron.cast.trimString" -> "true") {
+      assertTrimmedCast(" true ", BooleanType)
+    }
+  }
+
+  test("cast trim disabled via auron conf") {
+    withSQLConf("spark.auron.cast.trimString" -> "false") {
+      assertNonTrimmedCast(" 42 ", IntegerType)
+    }
+  }
+
+  test("cast trim disabled via auron conf for boolean cast") {
+    withSQLConf("spark.auron.cast.trimString" -> "false") {
+      assertNonTrimmedCast(" true ", BooleanType)
+    }
+  }
+
+  test("cast with non-string child remains unchanged") {
+    val expr = Cast(Literal(1.5), IntegerType)
+    val nativeExpr = NativeConverters.convertExpr(expr)
+
+    assert(nativeExpr.hasTryCast)
+    val childExpr = nativeExpr.getTryCast.getExpr
+    assert(!childExpr.hasScalarFunction)
+    assert(childExpr.hasLiteral)
+  }
+
+  test("float scan pruning keeps column and literal comparisons") {
+    val comparisons = Seq(
+      GreaterThan(AttributeReference("d", DoubleType)(), Literal(100.0)),
+      GreaterThan(AttributeReference("f", FloatType)(), Literal(100.0f)))
+
+    comparisons.foreach { expr =>
+      val pruning = NativeConverters.convertScanPruningExpr(expr).getBinaryExpr
+      assert(pruning.getL.hasColumn)
+      assert(pruning.getR.hasLiteral)
+
+      val rowFilter = NativeConverters.convertExpr(expr).getBinaryExpr
+      assert(rowFilter.getL.getScalarFunction.getName == "Spark_NormalizeNanAndZero")
+      assert(rowFilter.getR.getScalarFunction.getName == "Spark_NormalizeNanAndZero")
+    }
+  }
+}

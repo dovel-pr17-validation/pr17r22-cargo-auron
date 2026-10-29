@@ -1,0 +1,208 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.spark.sql.execution.auron.plan
+
+import scala.collection.immutable.SortedMap
+import scala.collection.mutable.ArrayBuffer
+import scala.jdk.CollectionConverters._
+
+import org.apache.spark.OneToOneDependency
+import org.apache.spark.Partition
+import org.apache.spark.sql.auron.NativeConverters
+import org.apache.spark.sql.auron.NativeHelper
+import org.apache.spark.sql.auron.NativePartition
+import org.apache.spark.sql.auron.NativeRDD
+import org.apache.spark.sql.auron.NativeSupports
+import org.apache.spark.sql.auron.Shims
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.Ascending
+import org.apache.spark.sql.catalyst.expressions.Attribute
+import org.apache.spark.sql.catalyst.expressions.NullsFirst
+import org.apache.spark.sql.catalyst.expressions.SortOrder
+import org.apache.spark.sql.catalyst.expressions.codegen.LazilyGeneratedOrdering
+import org.apache.spark.sql.catalyst.plans.physical.Partitioning
+import org.apache.spark.sql.catalyst.plans.physical.SinglePartition
+import org.apache.spark.sql.catalyst.plans.physical.UnknownPartitioning
+import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.execution.UnaryExecNode
+import org.apache.spark.sql.execution.metric.SQLMetric
+
+import org.apache.auron.metric.SparkMetricNode
+import org.apache.auron.protobuf.FetchLimit
+import org.apache.auron.protobuf.PhysicalExprNode
+import org.apache.auron.protobuf.PhysicalPlanNode
+import org.apache.auron.protobuf.PhysicalSortExprNode
+import org.apache.auron.protobuf.SortExecNode
+
+abstract class NativeTakeOrderedBase(
+    limit: Int,
+    offset: Int,
+    sortOrder: Seq[SortOrder],
+    override val child: SparkPlan)
+    extends UnaryExecNode
+    with NativeSupports {
+
+  override lazy val metrics: Map[String, SQLMetric] = SortedMap[String, SQLMetric]() ++ Map(
+    NativeHelper
+      .getDefaultNativeMetrics(sparkContext, Set("stage_id", "output_rows", "elapsed_compute"))
+      .toSeq: _*)
+
+  override def output: Seq[Attribute] = child.output
+  override def outputPartitioning: Partitioning = SinglePartition
+  override def outputOrdering: Seq[SortOrder] = sortOrder
+
+  private def nativeSortExprs = sortOrder.map { sortOrder =>
+    PhysicalExprNode
+      .newBuilder()
+      .setSort(
+        PhysicalSortExprNode
+          .newBuilder()
+          .setExpr(NativeConverters.convertExpr(sortOrder.child))
+          .setAsc(sortOrder.direction == Ascending)
+          .setNullsFirst(sortOrder.nullOrdering == NullsFirst)
+          .build())
+      .build()
+  }
+
+  override def executeCollect(): Array[InternalRow] = {
+    val partial = Shims.get.createNativePartialTakeOrderedExec(limit, sortOrder, child, metrics)
+    val ord = new LazilyGeneratedOrdering(sortOrder, output)
+
+    // all partitions are sorted, so perform a sorted-merge to achieve the result
+    val rows =
+      partial
+        .execute()
+        .map(_.copy())
+        .mapPartitions(iter => Iterator.single(iter.toArray))
+        .reduce { case (array1, array2) =>
+          val result = ArrayBuffer[InternalRow]()
+          var i = 0
+          var j = 0
+
+          while (result.length < limit && (i < array1.length || j < array2.length)) {
+            0 match {
+              case _ if i == array1.length =>
+                result.append(array2(j))
+                j += 1
+              case _ if j == array2.length =>
+                result.append(array1(i))
+                i += 1
+              case _ =>
+                if (ord.compare(array1(i), array2(j)) <= 0) {
+                  result.append(array1(i))
+                  i += 1
+                } else {
+                  result.append(array2(j))
+                  j += 1
+                }
+            }
+          }
+          result.toArray
+        }
+    if (offset > 0) rows.drop(offset) else rows
+  }
+
+  // check whether native converting is supported
+  nativeSortExprs
+
+  override def doExecuteNative(): NativeRDD = {
+    val partial = Shims.get.createNativePartialTakeOrderedExec(limit, sortOrder, child, metrics)
+    if (!partial.outputPartitioning.isInstanceOf[UnknownPartitioning]
+      && partial.outputPartitioning.numPartitions <= 1) {
+      return NativeHelper.executeNative(partial)
+    }
+
+    // merge top-K from every children partitions into a single partition
+    val shuffled = Shims.get.createNativeShuffleExchangeExec(SinglePartition, partial)
+    val shuffledRDD = NativeHelper.executeNative(shuffled)
+    val nativeSortExprs = this.nativeSortExprs
+
+    // take top-K from the final partition
+    new NativeRDD(
+      sparkContext,
+      metrics = SparkMetricNode(metrics, shuffledRDD.metrics :: Nil),
+      shuffledRDD.partitions,
+      shuffledRDD.partitioner,
+      new OneToOneDependency(shuffledRDD) :: Nil,
+      rddShuffleReadFull = false,
+      (inputPartition, taskContext) => {
+        val nativeTakeOrderedExec = SortExecNode
+          .newBuilder()
+          .setInput(shuffledRDD.nativePlan(inputPartition, taskContext))
+          .addAllExpr(nativeSortExprs.asJava)
+          .setFetchLimit(FetchLimit.newBuilder().setLimit(limit).setOffset(offset))
+          .build()
+        PhysicalPlanNode.newBuilder().setSort(nativeTakeOrderedExec).build()
+      },
+      friendlyName = "NativeRDD.FinalTakeOrdered")
+  }
+}
+
+abstract class NativePartialTakeOrderedBase(
+    limit: Int,
+    sortOrder: Seq[SortOrder],
+    override val child: SparkPlan,
+    override val metrics: Map[String, SQLMetric])
+    extends UnaryExecNode
+    with NativeSupports {
+
+  override def output: Seq[Attribute] = child.output
+  override def outputPartitioning: Partitioning = child.outputPartitioning
+
+  private def nativeSortExprs = sortOrder.map { sortOrder =>
+    PhysicalExprNode
+      .newBuilder()
+      .setSort(
+        PhysicalSortExprNode
+          .newBuilder()
+          .setExpr(NativeConverters.convertExpr(sortOrder.child))
+          .setAsc(sortOrder.direction == Ascending)
+          .setNullsFirst(sortOrder.nullOrdering == NullsFirst)
+          .build())
+      .build()
+  }
+
+  // check whether native converting is supported
+  nativeSortExprs
+
+  override def doExecuteNative(): NativeRDD = {
+    val inputRDD = NativeHelper.executeNative(child)
+    val nativeSortExprs = this.nativeSortExprs
+    val nativePartitions = inputRDD.partitions.map { inputPartition =>
+      NativePartition[Partition](inputPartition.index, inputPartition)
+    }
+
+    new NativeRDD(
+      sparkContext,
+      metrics = SparkMetricNode(metrics, inputRDD.metrics :: Nil),
+      nativePartitions.toArray,
+      inputRDD.partitioner,
+      new OneToOneDependency(inputRDD) :: Nil,
+      rddShuffleReadFull = false,
+      (partition, taskContext) => {
+        val inputPartition = NativePartition.unwrap(partition)
+        val nativeTakeOrderedExec = SortExecNode
+          .newBuilder()
+          .setInput(inputRDD.nativePlan(inputPartition, taskContext))
+          .addAllExpr(nativeSortExprs.asJava)
+          .setFetchLimit(FetchLimit.newBuilder().setLimit(limit))
+          .build()
+        PhysicalPlanNode.newBuilder().setSort(nativeTakeOrderedExec).build()
+      },
+      friendlyName = "NativeRDD.PartialTakeOrdered")
+  }
+}

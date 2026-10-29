@@ -1,0 +1,45 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+services:
+  build-release:
+    platform: ${AURON_DOCKER_PLATFORM:-linux/amd64}
+    build: ${BUILD_CONTEXT:-./centos7}
+    volumes:
+      - ~/.m2:/root/.m2:rw
+      - ~/.sbt:/root/.sbt:rw
+      - ~/.cargo/git:/root/.cargo/git:rw
+      - ~/.cargo/registry:/root/.cargo/registry:rw
+      - ./../../:/auron:rw
+      - ./../../target-docker:/auron/target:rw
+      - ./../../target-docker/spark-extension-target:/auron/spark-extension/target:rw
+      - ./../../target-docker/spark-extension-shims-spark-target:/auron/spark-extension-shims-spark/target:rw
+      - ./../../target-docker/build-helper-proto-target:/auron/dev/mvn-build-helper/proto/target:rw
+      - ./../../target-docker/build-helper-assembly-target:/auron/dev/mvn-build-helper/assembly/target:rw
+    environment:
+      RUSTFLAGS: "-C target-cpu=skylake"
+      AURON_BUILD_ARGS: "${AURON_BUILD_ARGS}"
+      AURON_BUILD_BRANCH: "${AURON_BUILD_BRANCH}"
+      AURON_BUILD_REVISION: "${AURON_BUILD_REVISION}"
+      AURON_JAVA_VERSION: "${AURON_JAVA_VERSION:-8}"
+    command: >
+      bash -c '
+        source ~/.bashrc &&
+        cd /auron &&
+        echo "[DOCKER] Running: ./build/mvn $AURON_BUILD_ARGS" &&
+        ./build/mvn $AURON_BUILD_ARGS
+      '

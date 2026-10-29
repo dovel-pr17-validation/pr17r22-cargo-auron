@@ -1,0 +1,88 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+[package]
+name = "auron"
+version = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["tokio/rt-multi-thread", "jemalloc"]
+jemalloc = ["dep:tikv-jemallocator"]
+jemalloc-pprof = ["dep:tikv-jemalloc-ctl", "dep:tikv-jemalloc-sys", "dep:jemalloc_pprof", "dep:pprof", "dep:poem", "dep:serde", "http-service"]
+http-service = []
+
+[dependencies]
+arrow = { workspace = true }
+auron-jni-bridge = { workspace = true }
+auron-memmgr = { workspace = true }
+auron-planner = { workspace = true }
+datafusion = { workspace = true }
+datafusion-ext-commons = { workspace = true }
+datafusion-ext-plans = { workspace = true }
+
+futures = { workspace = true }
+jni = { workspace = true }
+log = { workspace = true }
+once_cell = { workspace = true }
+panic-message = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+
+[dependencies.tikv-jemalloc-ctl]
+version = "0.6.1"
+optional = true
+features = ["use_std"]
+
+[dependencies.tikv-jemalloc-sys]
+version = "0.6.0"
+optional = true
+features = ["stats", "profiling", "unprefixed_malloc_on_supported_platforms", "disable_initial_exec_tls"]
+
+[dependencies.tikv-jemallocator]
+version = "0.6.1"
+optional = true
+features = ["disable_initial_exec_tls"]
+
+[dependencies.jemalloc_pprof]
+version = "0.8.0"
+features = ["symbolize"]
+optional = true
+
+[dependencies.pprof]
+version = "0.15.0"
+optional = true
+features = ["flamegraph", "protobuf-codec", "protobuf"]
+
+[dependencies.poem]
+version = "3.1.12"
+optional = true
+features = ["rustls", "test"]
+
+
+[dependencies.serde]
+version = "1.0.228"
+optional = true

@@ -1,0 +1,1251 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.auron
+
+import org.apache.spark.sql.{AuronQueryTest, Row}
+import org.apache.spark.sql.auron.NativeRDD
+import org.apache.spark.sql.auron.join.JoinBuildSides.{JoinBuildLeft, JoinBuildRight}
+import org.apache.spark.sql.execution.auron.plan.NativeFilterBase
+import org.apache.spark.sql.execution.auron.plan.NativeOrcScanBase
+import org.apache.spark.sql.execution.auron.plan.NativeParquetScanBase
+import org.apache.spark.sql.execution.auron.plan.NativeProjectBase
+import org.apache.spark.sql.execution.auron.plan.NativeShuffledHashJoinBase
+import org.apache.spark.sql.execution.auron.plan.NativeShuffleExchangeBase
+import org.apache.spark.sql.execution.auron.plan.NativeShuffleExchangeExec
+import org.apache.spark.sql.execution.auron.plan.NativeSortMergeJoinBase
+import org.apache.spark.sql.execution.joins.auron.plan.NativeBroadcastJoinExec
+
+import org.apache.auron.jni.JniBridge
+import org.apache.auron.spark.configuration.SparkAuronConfiguration
+import org.apache.auron.util.AuronTestUtils
+
+class AuronQuerySuite extends AuronQueryTest with BaseAuronSQLSuite with AuronSQLTestHelper {
+  import testImplicits._
+
+  test("config alt keys are honored") {
+    // AURON_ENABLED has primary key "spark.auron.enabled" and alt key "spark.auron.enable".
+    // Setting either key must take effect (primary takes precedence over alt).
+    withSQLConf("spark.auron.enabled" -> "false") {
+      assert(!SparkAuronConfiguration.AURON_ENABLED.get())
+    }
+    withSQLConf("spark.auron.enable" -> "false") {
+      assert(!SparkAuronConfiguration.AURON_ENABLED.get())
+    }
+    withSQLConf("spark.auron.enabled" -> "true") {
+      assert(SparkAuronConfiguration.AURON_ENABLED.get())
+    }
+    withSQLConf("spark.auron.enable" -> "true") {
+      assert(SparkAuronConfiguration.AURON_ENABLED.get())
+    }
+    // Primary key wins when both are set to conflicting values.
+    withSQLConf("spark.auron.enabled" -> "true", "spark.auron.enable" -> "false") {
+      assert(SparkAuronConfiguration.AURON_ENABLED.get())
+    }
+  }
+
+  test("ORC reader batch size configuration") {
+    assert(JniBridge.intConf("ORC_BATCH_SIZE") == 10000)
+    Seq(128, 256).foreach { globalBatchSize =>
+      withSparkConf("spark.auron.batchSize" -> globalBatchSize.toString) {
+        assert(JniBridge.intConf("ORC_BATCH_SIZE") == globalBatchSize)
+        withSparkConf("spark.auron.orc.batchSize" -> "2") {
+          assert(JniBridge.intConf("ORC_BATCH_SIZE") == 2)
+          assert(JniBridge.intConf("BATCH_SIZE") == globalBatchSize)
+        }
+        assert(JniBridge.intConf("ORC_BATCH_SIZE") == globalBatchSize)
+      }
+    }
+    Seq("0", "-1", "invalid", "2147483648").foreach { value =>
+      withSparkConf("spark.auron.orc.batchSize" -> value) {
+        intercept[IllegalArgumentException] {
+          JniBridge.intConf("ORC_BATCH_SIZE")
+        }
+      }
+    }
+  }
+
+  Seq("orc", "parquet").foreach { format =>
+    test(s"ORC reader batch size only changes ORC batches: $format") {
+      withTempPath { path =>
+        // Keep each decoded row above the coalescer's memory threshold so that
+        // the project's input batch count exposes the reader's batch boundaries.
+        val valueSize = 3 * 1024 * 1024
+        withSQLConf("spark.auron.enabled" -> "false") {
+          spark
+            .range(7)
+            .selectExpr(
+              "id",
+              s"CASE WHEN id = 0 THEN NULL WHEN id = 1 THEN '' ELSE repeat('x', $valueSize) END AS s",
+              s"CAST(CASE WHEN id = 2 THEN NULL WHEN id = 3 THEN '' ELSE repeat('y', $valueSize) END AS BINARY) AS b")
+            .coalesce(1)
+            .write
+            .format(format)
+            .save(path.getCanonicalPath)
+        }
+        val expected = (0L until 7L).map { id =>
+          Row(
+            id,
+            if (id == 0) null else if (id == 1) 0 else valueSize,
+            if (id == 2) null else if (id == 3) 0 else valueSize)
+        }
+        val batchCounts = Seq(1, 2, 3, 16).map { batchSize =>
+          var batchCount = 0L
+          withSparkConf("spark.auron.orc.batchSize" -> batchSize.toString) {
+            val df = spark.read
+              .format(format)
+              .load(path.getCanonicalPath)
+              .selectExpr("id", "length(s)", "octet_length(b)")
+            assert(df.collect().toSeq.sortBy(_.getLong(0)) == expected)
+            assertPlanIsNative(df)
+            val plan = df.queryExecution.executedPlan
+            assert(collectFirst(plan) {
+              case _: NativeOrcScanBase if format == "orc" => true
+              case _: NativeParquetScanBase if format == "parquet" => true
+            }.contains(true))
+            val project = collectFirst(plan) { case p: NativeProjectBase => p }.get
+            batchCount = project.metrics("input_batch_count").value
+            if (format == "orc") {
+              assert(batchCount == (7 + batchSize - 1) / batchSize)
+            }
+          }
+          batchCount
+        }
+        if (format == "parquet") {
+          // Parquet chooses an adaptive batch size independently of the ORC setting.
+          assert(batchCounts.head > 0 && batchCounts.distinct.size == 1)
+        }
+      }
+    }
+  }
+
+  test("test partition path has url encoded character") {
+    withTable("t1") {
+      sql(
+        "create table t1 using parquet PARTITIONED BY (part) as select 1 as c1, 2 as c2, 'test test' as part")
+      checkSparkAnswerAndOperator("select * from t1")
+    }
+  }
+
+  test("empty output in bnlj") {
+    withTable("t1", "t2") {
+      sql("create table t1 using parquet as select 1 as c1, 2 as c2")
+      sql("create table t2 using parquet as select 1 as c1, 3 as c3")
+      checkSparkAnswerAndOperator("select 1 from t1 left join t2")
+    }
+  }
+
+  test("test filter with year function") {
+    withSQLConf("spark.auron.udf.singleChildFallback.enabled" -> "true") {
+      withTable("t1") {
+        sql("create table t1 using parquet as select '2024-12-18' as event_time")
+        checkSparkAnswerAndOperator(s"""
+             |select year, count(*)
+             |from (select event_time, year(event_time) as year from t1) t
+             |where year <= 2024
+             |group by year
+             |""".stripMargin)
+      }
+    }
+  }
+
+  test("test select multiple spark ext functions with the same signature") {
+    withSQLConf("spark.auron.udf.singleChildFallback.enabled" -> "true") {
+      withTable("t1") {
+        sql("create table t1 using parquet as select '2024-12-18' as event_time")
+        checkSparkAnswerAndOperator("select year(event_time), month(event_time) from t1")
+      }
+    }
+  }
+
+  test("test parquet/orc format table with complex data type") {
+    def createTableStatement(format: String): String = {
+      s"""create table test_with_complex_type(
+         |id bigint comment 'pk',
+         |m map<string, string> comment 'test read map type',
+         |l array<string> comment 'test read list type',
+         |s string comment 'string type'
+         |) USING $format
+         |""".stripMargin
+    }
+    Seq("parquet", "orc").foreach(format =>
+      withTable("test_with_complex_type") {
+        sql(createTableStatement(format))
+        sql(
+          "insert into test_with_complex_type select 1 as id, map('zero', '0', 'one', '1') as m, array('test','auron') as l, 'auron' as s")
+        checkSparkAnswerAndOperator("select id,l,m from test_with_complex_type")
+      })
+  }
+
+  test("binary type in range partitioning") {
+    withTable("t1", "t2") {
+      sql("create table t1(c1 binary, c2 int) using parquet")
+      sql("insert into t1 values (cast('test1' as binary), 1), (cast('test2' as binary), 2)")
+      val df = checkSparkAnswerAndOperator("select c2 from t1 order by c1")
+      val exchange = collectFirst(df.queryExecution.executedPlan) {
+        case e: NativeShuffleExchangeExec =>
+          e
+      }.get
+      val nativeShuffleRDD =
+        exchange.shuffleDependency.rdd.dependencies.head.rdd.asInstanceOf[NativeRDD]
+      assert(!nativeShuffleRDD.nativePlanWrapper.p.getClass.getDeclaredFields.exists { field =>
+        classOf[NativeShuffleExchangeBase].isAssignableFrom(field.getType)
+      })
+    }
+  }
+
+  test("repartition over MapType") {
+    withTable("t_map") {
+      sql("create table t_map using parquet as select map('a', '1', 'b', '2') as data_map")
+      checkSparkAnswerAndOperator("SELECT /*+ repartition(10) */ data_map FROM t_map")
+    }
+  }
+
+  test("repartition over MapType with ArrayType") {
+    withTable("t_map_struct") {
+      sql(
+        "create table t_map_struct using parquet as select named_struct('m', map('x', '1')) as data_struct")
+      checkSparkAnswerAndOperator("SELECT /*+ repartition(10) */ data_struct FROM t_map_struct")
+    }
+  }
+
+  test("repartition over ArrayType with MapType") {
+    withTable("t_array_map") {
+      sql("""
+          |create table t_array_map using parquet as
+          |select array(map('k1', 1, 'k2', 2), map('k3', 3)) as array_of_map
+          |""".stripMargin)
+      checkSparkAnswerAndOperator("SELECT /*+ repartition(10) */ array_of_map FROM t_array_map")
+    }
+  }
+
+  test("repartition over StructType with MapType") {
+    withTable("t_struct_map") {
+      sql("""
+          |create table t_struct_map using parquet as
+          |select named_struct('id', 101, 'metrics', map('ctr', 0.123d, 'cvr', 0.045d)) as user_metrics
+          |""".stripMargin)
+      checkSparkAnswerAndOperator("SELECT /*+ repartition(10) */ user_metrics FROM t_struct_map")
+    }
+  }
+
+  test("repartition over MapType with StructType") {
+    withTable("t_map_struct_value") {
+      sql("""
+          |create table t_map_struct_value using parquet as
+          |select map(
+          |  'item1', named_struct('count', 3, 'score', 4.5d),
+          |  'item2', named_struct('count', 7, 'score', 9.1d)
+          |) as map_struct_value
+          |""".stripMargin)
+      checkSparkAnswerAndOperator(
+        "SELECT /*+ repartition(10) */ map_struct_value FROM t_map_struct_value")
+    }
+  }
+
+  test("repartition over nested MapType") {
+    withTable("t_nested_map") {
+      sql("""
+          |create table t_nested_map using parquet as
+          |select map(
+          |  'outer1', map('inner1', 10, 'inner2', 20),
+          |  'outer2', map('inner3', 30)
+          |) as nested_map
+          |""".stripMargin)
+      checkSparkAnswerAndOperator("SELECT /*+ repartition(10) */ nested_map FROM t_nested_map")
+    }
+  }
+
+  test("repartition over ArrayType of StructType with MapType") {
+    withTable("t_array_struct_map") {
+      sql("""
+          |create table t_array_struct_map using parquet as
+          |select array(
+          |  named_struct('name', 'user1', 'features', map('f1', 1.0d, 'f2', 2.0d)),
+          |  named_struct('name', 'user2', 'features', map('f3', 3.5d))
+          |) as user_feature_array
+          |""".stripMargin)
+      checkSparkAnswerAndOperator(
+        "SELECT /*+ repartition(10) */ user_feature_array FROM t_array_struct_map")
+    }
+  }
+
+  test("log function with negative input") {
+    withTable("t1") {
+      sql("create table t1 using parquet as select -1 as c1")
+      checkSparkAnswerAndOperator("select ln(c1) from t1")
+    }
+  }
+
+  test("floor function with long input") {
+    withSQLConf("spark.auron.udf.singleChildFallback.enabled" -> "true") {
+      withTable("t1") {
+        sql("create table t1 using parquet as select 1L as c1, 2.2 as c2")
+        checkSparkAnswerAndOperator("select floor(c1), floor(c2) from t1")
+      }
+    }
+  }
+
+  test("SPARK-32234 read ORC table with column names all starting with '_col'") {
+    withTable("test_hive_orc_impl") {
+      spark.sql(s"""
+           | CREATE TABLE test_hive_orc_impl
+           | (_col1 INT, _col2 STRING, _col3 INT)
+           | USING ORC
+               """.stripMargin)
+      spark.sql(s"""
+           | INSERT INTO
+           | test_hive_orc_impl
+           | VALUES(9, '12', 2020)
+               """.stripMargin)
+      checkSparkAnswerAndOperator("SELECT _col2 FROM test_hive_orc_impl")
+    }
+  }
+
+  test("SPARK-32864: Support ORC forced positional evolution") {
+    if (AuronTestUtils.isSparkV32OrGreater) {
+      Seq(true, false).foreach { forcePositionalEvolution =>
+        withEnvConf(
+          SparkAuronConfiguration.ORC_FORCE_POSITIONAL_EVOLUTION.key -> forcePositionalEvolution.toString) {
+          withTempPath { f =>
+            val path = f.getCanonicalPath
+            Seq[(Integer, Integer)]((1, 2), (3, 4), (5, 6), (null, null))
+              .toDF("c1", "c2")
+              .write
+              .orc(path)
+            checkSparkAnswerAndOperator(() => spark.read.orc(path))
+
+            withTable("t") {
+              sql(s"CREATE EXTERNAL TABLE t(c3 INT, c2 INT) USING ORC LOCATION '$path'")
+              checkSparkAnswerAndOperator(() => spark.table("t"))
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-32864: Support ORC forced positional evolution with partitioned table") {
+    if (AuronTestUtils.isSparkV32OrGreater) {
+      Seq(true, false).foreach { forcePositionalEvolution =>
+        withEnvConf(
+          SparkAuronConfiguration.ORC_FORCE_POSITIONAL_EVOLUTION.key -> forcePositionalEvolution.toString) {
+          withTempPath { f =>
+            val path = f.getCanonicalPath
+            Seq[(Integer, Integer, Integer)]((1, 2, 1), (3, 4, 2), (5, 6, 3), (null, null, 4))
+              .toDF("c1", "c2", "p")
+              .write
+              .partitionBy("p")
+              .orc(path)
+            checkSparkAnswerAndOperator(() => spark.read.orc(path))
+
+            withTable("t") {
+              sql(s"""
+                     |CREATE TABLE t(c3 INT, c2 INT)
+                     |USING ORC
+                     |PARTITIONED BY (p int)
+                     |LOCATION '$path'
+                     |""".stripMargin)
+              sql("MSCK REPAIR TABLE t")
+              checkSparkAnswerAndOperator(() => spark.table("t"))
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test("test filter with quarter function") {
+    withTable("t1") {
+      sql("""
+          |create table t1 using parquet as
+          |select '2024-02-10' as event_time
+          |union all select '2024-04-11'
+          |union all select '2024-07-20'
+          |union all select '2024-12-18'
+          |""".stripMargin)
+
+      checkSparkAnswerAndOperator("""
+            |select q, count(*)
+            |from (select event_time, quarter(event_time) as q from t1) t
+            |where q <= 3
+            |group by q
+            |order by q
+            |""".stripMargin)
+    }
+  }
+
+  test("lpad/rpad basic") {
+    withTable("pad_tbl") {
+      sql(s"CREATE TABLE pad_tbl(id INT, txt STRING, len INT, pad STRING) USING parquet")
+      sql(s"""
+             |INSERT INTO pad_tbl VALUES
+             | (1, 'abc', 5, ''),
+             | (2, 'abc', 5, ' '),
+             | (3, 'spark', 2, '0'),
+             | (4, 'spark', 2, '0'),
+             | (5, '9', 5, 'ab'),
+             | (6, '9', 5, 'ab'),
+             | (7, 'hi', 5, ''),
+             | (8, 'hi', 5, ''),
+             | (9, 'x', 0, 'a'),
+             | (10,'x', -1, 'a'),
+             | (11,'Z', 3, '++'),
+             | (12,'Z', 3, 'AB')
+      """.stripMargin)
+      checkSparkAnswerAndOperator("SELECT LPAD(txt, len, pad), RPAD(txt, len, pad) FROM pad_tbl")
+    }
+  }
+
+  test("reverse basic") {
+    Seq(
+      ("select reverse('abc')", Row("cba")),
+      ("select reverse('spark')", Row("kraps")),
+      ("select reverse('hello world')", Row("dlrow olleh")),
+      ("select reverse('12345')", Row("54321")),
+      ("select reverse('a')", Row("a")), // Edge case: single character
+      ("select reverse('')", Row("")), // Edge case: empty string
+      ("select reverse('hello' || ' world')", Row("dlrow olleh"))).foreach { case (q, expected) =>
+      checkAnswer(sql(q), Seq(expected))
+    }
+  }
+
+  test("initcap basic") {
+    withTable("initcap_basic_tbl") {
+      sql(s"CREATE TABLE initcap_basic_tbl(id INT, txt STRING) USING parquet")
+      sql(s"""
+           |INSERT INTO initcap_basic_tbl VALUES
+           | (1, 'spark sql'),
+           | (2, 'SPARK'),
+           | (3, 'sPaRk'),
+           | (4, ''),
+           | (5, NULL)
+        """.stripMargin)
+      checkSparkAnswerAndOperator("select id, initcap(txt) from initcap_basic_tbl")
+    }
+  }
+
+  test("initcap: word boundaries and punctuation") {
+    withTable("initcap_bound_tbl") {
+      sql(s"CREATE TABLE initcap_bound_tbl(id INT, txt STRING) USING parquet")
+      sql(s"""
+           |INSERT INTO initcap_bound_tbl VALUES
+           | (1, 'hello world'),
+           | (2, 'hello_world'),
+           | (3, 'über-alles'),
+           | (4, 'foo.bar/baz'),
+           | (5, 'v2Ray is COOL'),
+           | (6, 'rock''n''roll'),
+           | (7, 'hi\tthere'),
+           | (8, 'hi\nthere')
+        """.stripMargin)
+      checkSparkAnswerAndOperator("select id, initcap(txt) from initcap_bound_tbl")
+    }
+  }
+
+  test("initcap: mixed cases and edge cases") {
+    withTable("initcap_mixed_tbl") {
+      sql(s"CREATE TABLE initcap_mixed_tbl(id INT, txt STRING) USING parquet")
+      sql(s"""
+           |INSERT INTO initcap_mixed_tbl VALUES
+           | (1, 'a1b2 c3D4'),
+           | (2, '---abc--- ABC --ABC-- 世界 世 界 '),
+           | (3, ' multiple   spaces '),
+           | (4, 'AbCdE aBcDe'),
+           | (5, ' A B A b '),
+           | (6, 'aBćDe  ab世De AbĆdE aB世De ÄBĆΔE'),
+           | (7, 'i\u0307onic  FIDELİO'),
+           | (8, 'a🙃B🙃c  😄 😆')
+        """.stripMargin)
+      checkSparkAnswerAndOperator("select id, initcap(txt) from initcap_mixed_tbl")
+    }
+  }
+
+  test("test filter with hour function") {
+    withEnvConf("spark.auron.datetime.extract.enabled" -> "true") {
+      withTable("t_hour") {
+        sql("""
+              |create table t_hour using parquet as
+              |select to_timestamp('2024-12-18 01:23:45') as event_time union all
+              |select to_timestamp('2024-12-18 08:00:00') union all
+              |select to_timestamp('2024-12-18 08:59:59')
+              |""".stripMargin)
+
+        // Keep rows where HOUR >= 8, then group by hour
+        checkSparkAnswerAndOperator("""
+                |select h, count(*)
+                |from (select hour(event_time) as h from t_hour) t
+                |where h >= 8
+                |group by h
+                |order by h
+                |""".stripMargin)
+      }
+    }
+  }
+
+  test("test filter with minute function") {
+    withEnvConf("spark.auron.datetime.extract.enabled" -> "true") {
+      withTable("t_minute") {
+        sql("""
+              |create table t_minute using parquet as
+              |select to_timestamp('2024-12-18 00:00:00') as event_time union all
+              |select to_timestamp('2024-12-18 00:30:00') union all
+              |select to_timestamp('2024-12-18 12:30:59')
+              |""".stripMargin)
+
+        // Keep rows where MINUTE = 30, then group by minute
+        checkSparkAnswerAndOperator("""
+                |select m, count(*)
+                |from (select minute(event_time) as m from t_minute) t
+                |where m = 30
+                |group by m
+                |""".stripMargin)
+      }
+    }
+  }
+
+  test("test filter with second function") {
+    withEnvConf("spark.auron.datetime.extract.enabled" -> "true") {
+      withTable("t_second") {
+        sql("""
+              |create table t_second using parquet as
+              |select to_timestamp('2024-12-18 00:00:00') as event_time union all
+              |select to_timestamp('2024-12-18 01:23:00') union all
+              |select to_timestamp('2024-12-18 23:59:45')
+              |""".stripMargin)
+
+        // Keep rows where SECOND = 0, then group by second
+        checkSparkAnswerAndOperator("""
+                |select s, count(*)
+                |from (select second(event_time) as s from t_second) t
+                |where s = 0
+                |group by s
+                |""".stripMargin)
+      }
+    }
+  }
+
+  // For Date input: hour/minute/second should all be 0
+  test("timeparts on Date input return zeros") {
+    withEnvConf("spark.auron.datetime.extract.enabled" -> "true") {
+      withTable("t_date_parts") {
+        sql(
+          "create table t_date_parts using parquet as select date'2024-12-18' as d union all select date'2024-12-19'")
+        checkSparkAnswerAndOperator("""
+                |select
+                |  hour(d)   as h,
+                |  minute(d) as m,
+                |  second(d) as s
+                |from t_date_parts
+                |order by d
+                |""".stripMargin)
+      }
+    }
+  }
+
+  test("hour/minute/second respect timezone via from_utc_timestamp") {
+    withEnvConf("spark.auron.datetime.extract.enabled" -> "true") {
+      withTable("t_tz") {
+        // Construct: UTC 1970-01-01 00:00:00 → Asia/Shanghai => local 08:00:00
+        sql("""
+              |create table t_tz using parquet as
+              |select from_utc_timestamp(to_timestamp('1970-01-01 00:00:00'), 'Asia/Shanghai') as ts
+              |""".stripMargin)
+
+        checkSparkAnswerAndOperator("""
+                |select hour(ts), minute(ts), second(ts)
+                |from t_tz
+                |""".stripMargin)
+      }
+    }
+  }
+
+  test("minute/second with non-whole-hour offsets") {
+    withEnvConf("spark.auron.datetime.extract.enabled" -> "true") {
+      withTable("t_tz2") {
+        sql("""
+              |create table t_tz2 using parquet as
+              |select from_utc_timestamp(to_timestamp('2000-01-01 00:00:00'), 'Asia/Kolkata')   as ts1,  -- +05:30
+              |       from_utc_timestamp(to_timestamp('2000-01-01 00:00:00'), 'Asia/Kathmandu') as ts2   -- +05:45
+              |""".stripMargin)
+
+        // Kolkata -> 05:30:00; Kathmandu -> 05:45:00
+        checkSparkAnswerAndOperator(
+          "select minute(ts1), second(ts1), minute(ts2), second(ts2) from t_tz2")
+      }
+    }
+  }
+
+  test("cast struct to string") {
+    // SPARK-32499 SPARK-32501 SPARK-33291
+    if (AuronTestUtils.isSparkV31OrGreater) {
+      withTable("t_struct") {
+        sql("""
+              |create table t_struct using parquet as
+              |select named_struct('a', 1, 'b', 'hello', 'c', true) as s
+              |union all select named_struct('a', 2, 'b', 'world', 'c', false)
+              |union all select named_struct('a', null, 'b', 'test', 'c', null)
+              |""".stripMargin)
+
+        checkSparkAnswerAndOperator("select cast(s as string) from t_struct")
+      }
+    }
+  }
+
+  test("cast nested struct to string") {
+    if (AuronTestUtils.isSparkV31OrGreater) {
+      withTable("t_nested_struct") {
+        sql("""
+              |create table t_nested_struct using parquet as
+              |select named_struct('id', 1, 'inner', named_struct('x', 'a', 'y', 10)) as s
+              |union all select named_struct('id', 2, 'inner', named_struct('x', 'b', 'y', 20))
+              |""".stripMargin)
+
+        checkSparkAnswerAndOperator("select cast(s as string) from t_nested_struct")
+      }
+    }
+  }
+
+  test("cast struct with null fields to string") {
+    if (AuronTestUtils.isSparkV31OrGreater) {
+      withTable("t_struct_nulls") {
+        sql("""
+              |create table t_struct_nulls using parquet as
+              |select named_struct('f1', cast(null as int), 'f2', cast(null as string)) as s
+              |union all select named_struct('f1', 100, 'f2', 'value')
+              |""".stripMargin)
+
+        checkSparkAnswerAndOperator("select cast(s as string) from t_struct_nulls")
+      }
+    }
+  }
+
+  test("get field from nullable struct propagates parent null") {
+    withTable("t_nullable_struct") {
+      sql("""
+            |create table t_nullable_struct using parquet as
+            |select id, case when id = 1 then named_struct('child', 10) end as s
+            |from range(1, 3, 1, 1)
+            |""".stripMargin)
+
+      checkSparkAnswerAndOperator("select s.child from t_nullable_struct order by id")
+    }
+  }
+
+  test("cast map to string") {
+    if (AuronTestUtils.isSparkV31OrGreater) {
+      withTable("t_map") {
+        sql("""
+              |create table t_map using parquet as
+              |select map('a', 1, 'b', 2) as m
+              |union all select map('x', 10, 'y', 20, 'z', 30)
+              |union all select map('key', null)
+              |""".stripMargin)
+
+        checkSparkAnswerAndOperator("select cast(m as string) from t_map")
+      }
+    }
+  }
+
+  test("cast nested map to string") {
+    if (AuronTestUtils.isSparkV31OrGreater) {
+      withTable("t_nested_map") {
+        sql("""
+              |create table t_nested_map using parquet as
+              |select map('outer1', map('inner1', 1, 'inner2', 2)) as m
+              |union all select map('outer2', map('inner3', 3))
+              |""".stripMargin)
+
+        checkSparkAnswerAndOperator("select cast(m as string) from t_nested_map")
+      }
+    }
+  }
+
+  test("cast map with struct value to string") {
+    if (AuronTestUtils.isSparkV31OrGreater) {
+      withTable("t_map_struct") {
+        sql("""
+              |create table t_map_struct using parquet as
+              |select map('k1', named_struct('x', 'a', 'y', 10)) as m
+              |union all select map('k2', named_struct('x', 'b', 'y', 20))
+              |""".stripMargin)
+
+        checkSparkAnswerAndOperator("select cast(m as string) from t_map_struct")
+      }
+    }
+  }
+
+  test("cast empty map to string") {
+    if (AuronTestUtils.isSparkV31OrGreater) {
+      withTable("t_empty_map") {
+        sql("""
+              |create table t_empty_map using parquet as
+              |select map() as m
+              |union all select map('a', 1)
+              |""".stripMargin)
+
+        checkSparkAnswerAndOperator("select cast(m as string) from t_empty_map")
+      }
+    }
+  }
+
+  test("cume_dist window") {
+    withTable("t_cume_dist") {
+      sql("""
+            |create table t_cume_dist using parquet as
+            |select * from values
+            |  (1, 1, 10),
+            |  (1, 1, 20),
+            |  (1, 2, 30),
+            |  (2, 5, 40)
+            |as t(grp, id, v)
+            |""".stripMargin)
+
+      checkSparkAnswerAndOperator("""
+            |select
+            |  grp,
+            |  id,
+            |  v,
+            |  cume_dist() over (
+            |    partition by grp
+            |    order by id
+            |  ) as cume_dist_v
+            |from t_cume_dist
+            |order by grp, id, v
+            |""".stripMargin)
+    }
+  }
+
+  test("nth_value window with row frame") {
+    if (AuronTestUtils.isSparkV31OrGreater) {
+      withTable("t_nth_value") {
+        sql("""
+              |create table t_nth_value using parquet as
+              |select * from values
+              |  (1, 1, cast(null as string)),
+              |  (1, 2, 'b'),
+              |  (1, 3, 'c'),
+              |  (2, 1, 'x'),
+              |  (2, 2, cast(null as string))
+              |as t(grp, id, v)
+              |""".stripMargin)
+
+        if (AuronTestUtils.isSparkV32OrGreater) {
+          checkSparkAnswerAndOperator("""
+                |select
+                |  grp,
+                |  id,
+                |  v,
+                |  nth_value(v, 2) over (
+                |    partition by grp
+                |    order by id
+                |    rows between unbounded preceding and current row
+                |  ) as nth_value_all,
+                |  nth_value(v, 2) ignore nulls over (
+                |    partition by grp
+                |    order by id
+                |    rows between unbounded preceding and current row
+                |  ) as nth_value_ignore_nulls
+                |from t_nth_value
+                |order by grp, id
+                |""".stripMargin)
+        } else {
+          checkSparkAnswerAndOperator("""
+                |select
+                |  grp,
+                |  id,
+                |  v,
+                |  nth_value(v, 2) over (
+                |    partition by grp
+                |    order by id
+                |    rows between unbounded preceding and current row
+                |  ) as nth_value_all
+                |from t_nth_value
+                |order by grp, id
+                |""".stripMargin)
+        }
+      }
+    }
+  }
+
+  test("percent_rank window function") {
+    withTable("t_percent_rank") {
+      sql("""
+            |create table t_percent_rank using parquet as
+            |select * from values
+            |  (1, 1, 10),
+            |  (1, 1, 20),
+            |  (1, 2, 30),
+            |  (2, 5, 40)
+            |as t(grp, id, v)
+            |""".stripMargin)
+
+      checkSparkAnswerAndOperator("""
+            |select
+            |  grp,
+            |  id,
+            |  v,
+            |  percent_rank() over (
+            |    partition by grp
+            |    order by id
+            |  ) as percent_rank_v
+            |from t_percent_rank
+            |order by grp, id, v
+            |""".stripMargin)
+    }
+  }
+  test("standard LEFT ANTI JOIN includes NULL keys") {
+    // This test verifies that standard LEFT ANTI JOIN correctly includes NULL keys
+    // NULL keys should be in the result because NULL never matches anything
+    withTable("left_table", "right_table") {
+      sql("""
+            |CREATE TABLE left_table using parquet AS
+            |SELECT * FROM VALUES
+            |  (1, 2.0),
+            |  (1, 2.0),
+            |  (2, 1.0),
+            |  (2, 1.0),
+            |  (3, 3.0),
+            |  (null, null),
+            |  (null, 5.0),
+            |  (6, null)
+            |AS t(a, b)
+            |""".stripMargin)
+
+      sql("""
+            |CREATE TABLE right_table using parquet AS
+            |SELECT * FROM VALUES
+            |  (2, 3.0),
+            |  (2, 3.0),
+            |  (3, 2.0),
+            |  (4, 1.0),
+            |  (null, null),
+            |  (null, 5.0),
+            |  (6, null)
+            |AS t(c, d)
+            |""".stripMargin)
+
+      // Standard LEFT ANTI JOIN should include rows with NULL keys
+      // Expected: (1, 2.0), (1, 2.0), (null, null), (null, 5.0)
+      checkSparkAnswer(
+        "SELECT * FROM left_table LEFT ANTI JOIN right_table ON left_table.a = right_table.c")
+    }
+  }
+
+  test("native sort merge join supports inner residual condition") {
+    withSparkConf("spark.auron.forceShuffledHashJoin" -> "false") {
+      withSQLConf(
+        "spark.sql.adaptive.enabled" -> "false",
+        "spark.sql.autoBroadcastJoinThreshold" -> "-1",
+        "spark.sql.join.preferSortMergeJoin" -> "true") {
+        withTable("smj_left", "smj_right") {
+          sql("""
+                |CREATE TABLE smj_left USING parquet AS
+                |SELECT * FROM VALUES
+                |  (1, 1),
+                |  (2, 5),
+                |  (3, 7),
+                |  (4, 9)
+                |AS t(id, lv)
+                |""".stripMargin)
+
+          sql("""
+                |CREATE TABLE smj_right USING parquet AS
+                |SELECT * FROM VALUES
+                |  (1, 2),
+                |  (2, 4),
+                |  (3, 8),
+                |  (4, 9)
+                |AS t(id, rv)
+                |""".stripMargin)
+
+          val df = checkSparkAnswerAndOperator("""
+                |SELECT /*+ MERGE(l, r) */ l.id, l.lv, r.rv
+                |FROM smj_left l
+                |JOIN smj_right r
+                |  ON l.id = r.id AND l.lv < r.rv
+                |ORDER BY l.id
+                |""".stripMargin)
+
+          val plan = stripAQEPlan(df.queryExecution.executedPlan)
+          assert(
+            plan.collectFirst { case _: NativeSortMergeJoinBase => true }.isDefined,
+            s"expected NativeSortMergeJoinBase in executed plan, but got:\n$plan")
+          assert(
+            plan.collectFirst {
+              case filter: NativeFilterBase
+                  if filter.child.isInstanceOf[NativeSortMergeJoinBase] =>
+                true
+            }.isEmpty,
+            s"expected residual condition to be evaluated by native SMJ, but got:\n$plan")
+        }
+      }
+    }
+  }
+
+  test("native residual join condition can be disabled") {
+    withSparkConf("spark.auron.forceShuffledHashJoin" -> "false") {
+      withSQLConf(
+        "spark.auron.enable.native.join.condition" -> "false",
+        "spark.sql.adaptive.enabled" -> "false",
+        "spark.sql.autoBroadcastJoinThreshold" -> "-1",
+        "spark.sql.join.preferSortMergeJoin" -> "true") {
+        withTable("smj_disabled_left", "smj_disabled_right") {
+          sql("""
+                |CREATE TABLE smj_disabled_left USING parquet AS
+                |SELECT * FROM VALUES
+                |  (1, 1),
+                |  (2, 5),
+                |  (3, 7)
+                |AS t(id, lv)
+                |""".stripMargin)
+
+          sql("""
+                |CREATE TABLE smj_disabled_right USING parquet AS
+                |SELECT * FROM VALUES
+                |  (1, 2),
+                |  (2, 4),
+                |  (3, 8)
+                |AS t(id, rv)
+                |""".stripMargin)
+
+          val df = checkSparkAnswer("""
+                |SELECT /*+ MERGE(l, r) */ l.id, l.lv, r.rv
+                |FROM smj_disabled_left l
+                |JOIN smj_disabled_right r
+                |  ON l.id = r.id AND l.lv < r.rv
+                |ORDER BY l.id
+                |""".stripMargin)
+
+          val plan = stripAQEPlan(df.queryExecution.executedPlan)
+          assert(
+            plan.collectFirst { case _: NativeSortMergeJoinBase => true }.isEmpty,
+            s"expected native residual join condition to be disabled, but got:\n$plan")
+        }
+      }
+    }
+  }
+
+  test(
+    "native shuffled hash join supports inner residual condition in forceShuffledHashJoin mode") {
+    withSparkConf("spark.auron.forceShuffledHashJoin" -> "true") {
+      withSQLConf(
+        "spark.sql.adaptive.enabled" -> "false",
+        "spark.sql.autoBroadcastJoinThreshold" -> "-1",
+        "spark.sql.join.preferSortMergeJoin" -> "true") {
+        withTable("shj_left", "shj_right") {
+          sql("""
+                |CREATE TABLE shj_left USING parquet AS
+                |SELECT id, cast(id % 4 as int) AS lv
+                |FROM range(0, 1000)
+                |""".stripMargin)
+
+          sql("""
+                |CREATE TABLE shj_right USING parquet AS
+                |SELECT * FROM VALUES
+                |  (1L, 2),
+                |  (2L, 1),
+                |  (3L, 5),
+                |  (10L, 4)
+                |AS t(id, rv)
+                |""".stripMargin)
+
+          val df = checkSparkAnswerAndOperator("""
+                |SELECT /*+ MERGE(l, r) */ l.id, l.lv, r.rv
+                |FROM shj_left l
+                |JOIN shj_right r
+                |  ON l.id = r.id AND l.lv < r.rv
+                |ORDER BY l.id
+                |""".stripMargin)
+
+          val plan = stripAQEPlan(df.queryExecution.executedPlan)
+          assert(
+            plan.collectFirst { case _: NativeShuffledHashJoinBase => true }.isDefined,
+            s"expected NativeShuffledHashJoinBase in executed plan, but got:\n$plan")
+          assert(
+            plan.collectFirst {
+              case filter: NativeFilterBase
+                  if filter.child.isInstanceOf[NativeShuffledHashJoinBase] =>
+                true
+            }.isEmpty,
+            s"expected residual condition to be evaluated by native SHJ, but got:\n$plan")
+        }
+      }
+    }
+  }
+
+  test("native broadcast hash join supports inner residual condition") {
+    withSQLConf("spark.sql.adaptive.enabled" -> "false") {
+      withTable("bhj_left", "bhj_right") {
+        sql("""
+              |CREATE TABLE bhj_left USING parquet AS
+              |SELECT * FROM VALUES
+              |  (1, 1),
+              |  (1, 5),
+              |  (2, null),
+              |  (3, 7)
+              |AS t(id, lv)
+              |""".stripMargin)
+
+        sql("""
+              |CREATE TABLE bhj_right USING parquet AS
+              |SELECT * FROM VALUES
+              |  (1, 2),
+              |  (1, 4),
+              |  (2, 3),
+              |  (3, 8)
+              |AS t(id, rv)
+              |""".stripMargin)
+
+        Seq(("BROADCAST(r)", JoinBuildRight), ("BROADCAST(l)", JoinBuildLeft)).foreach {
+          case (hint, expectedBuildSide) =>
+            val df = checkSparkAnswerAndOperator(s"""
+               |SELECT /*+ $hint */ l.id
+               |FROM bhj_left l
+               |JOIN bhj_right r
+               |  ON l.id = r.id AND l.lv < r.rv
+               |ORDER BY l.id
+               |""".stripMargin)
+
+            val plan = stripAQEPlan(df.queryExecution.executedPlan)
+            val nativeBhj = plan
+              .collectFirst { case join: NativeBroadcastJoinExec => join }
+              .getOrElse(
+                fail(s"expected NativeBroadcastJoinExec in executed plan, but got:\n$plan"))
+            assert(nativeBhj.condition.nonEmpty)
+            assert(nativeBhj.broadcastSide == expectedBuildSide)
+        }
+      }
+    }
+  }
+
+  test("native broadcast hash join supports left outer residual condition") {
+    withSQLConf("spark.sql.adaptive.enabled" -> "false") {
+      withTable("bhj_left", "bhj_right") {
+        sql("""
+              |CREATE TABLE bhj_left USING parquet AS
+              |SELECT * FROM VALUES
+              |  (1, 1),
+              |  (1, 5),
+              |  (2, null),
+              |  (3, 7)
+              |AS t(id, lv)
+              |""".stripMargin)
+
+        sql("""
+              |CREATE TABLE bhj_right USING parquet AS
+              |SELECT * FROM VALUES
+              |  (1, 2),
+              |  (1, 4),
+              |  (2, 3),
+              |  (3, 8)
+              |AS t(id, rv)
+              |""".stripMargin)
+
+        val df = checkSparkAnswerAndOperator("""
+              |SELECT /*+ BROADCAST(r) */ l.id
+              |FROM bhj_left l
+              |LEFT JOIN bhj_right r
+              |  ON l.id = r.id AND l.lv < r.rv
+              |ORDER BY l.id
+              |""".stripMargin)
+
+        val plan = stripAQEPlan(df.queryExecution.executedPlan)
+        val nativeBhj = plan
+          .collectFirst { case join: NativeBroadcastJoinExec => join }
+          .getOrElse(fail(s"expected NativeBroadcastJoinExec in executed plan, but got:\n$plan"))
+        assert(nativeBhj.condition.nonEmpty)
+        assert(nativeBhj.leftKeys.nonEmpty)
+        assert(nativeBhj.broadcastSide == JoinBuildRight)
+      }
+    }
+  }
+
+  test("left join with NOT IN subquery should filter NULL values") {
+    // This test verifies the fix for the NULL handling issue in Anti join.
+    withSQLConf("spark.sql.autoBroadcastJoinThreshold" -> "-1") {
+      val query =
+        """
+          |WITH t2 AS (
+          |  -- Large table: 100000 rows (0..99999)
+          |  SELECT id AS loan_req_no
+          |  FROM range(0, 100000)
+          |),
+          |t1 AS (
+          |  -- Small table: 10 rows that can match t2
+          |  SELECT * FROM VALUES
+          |    (1, 'A'),
+          |    (2, 'B'),
+          |    (3, 'C'),
+          |    (4, 'D'),
+          |    (5, 'E'),
+          |    (6, 'F'),
+          |    (7, 'G'),
+          |    (8, 'H'),
+          |    (9, 'I'),
+          |    (10,'J')
+          |  AS t1(loan_req_no, partner_code)
+          |),
+          |blk AS (
+          |  SELECT * FROM VALUES
+          |    ('B'),
+          |    ('Z')
+          |  AS blk(code)
+          |)
+          |SELECT
+          |  COUNT(*) AS cnt
+          |FROM t2
+          |LEFT JOIN t1
+          |  ON t1.loan_req_no = t2.loan_req_no
+          |WHERE t1.partner_code NOT IN (SELECT code FROM blk)
+          |""".stripMargin
+
+      checkSparkAnswer(query)
+    }
+  }
+
+  test("NOT IN subquery with NULL values") {
+    val row = identity[(java.lang.Integer, java.lang.Integer)] _
+    Seq(row((1, 1)), row((2, 2)), row((3, null)))
+      .toDF("a", "b")
+      .createOrReplaceTempView("tbl")
+    val df = checkSparkAnswer("select * from tbl where a not in (select b from tbl)")
+
+    // Spark 3.0: NOT IN subquery is converted to BroadcastNestedLoopJoinExec, and falls back due to unsupported join condition
+    if (AuronTestUtils.isSparkV31OrGreater) {
+      assert(collectFirst(df.queryExecution.executedPlan) { case bhj: NativeBroadcastJoinExec =>
+        assert(bhj.isNullAwareAntiJoin)
+        bhj
+      }.isDefined)
+    }
+  }
+
+  test("aggregate with filter clause") {
+    withTable("t_filter_agg_2289") {
+      sql("""
+        CREATE TABLE t_filter_agg_2289(
+          category STRING,
+          amount INT,
+          quantity INT,
+          price DOUBLE,
+          is_vip BOOLEAN
+        ) USING parquet
+      """)
+
+      sql("""
+        INSERT INTO t_filter_agg_2289 VALUES
+          (' electronics', 100,  1,  99.99, true),
+          (' electronics', 200,  2, 199.99, false),
+          (' electronics', 300,  3, 299.99, true),
+          ('  clothing  ', 400,  4, 399.99, false),
+          ('  clothing  ', 500,  5, 499.99, true),
+          ('  clothing  ', NULL, NULL, NULL, true)
+      """)
+
+      // Basic FILTER on SUM(int): 100 + 300 + 500 = 900 (NULL amount contributes 0)
+      checkSparkAnswerAndOperator(
+        "SELECT SUM(amount) FILTER (WHERE is_vip = true) FROM t_filter_agg_2289")
+
+      // FILTER on SUM with GROUP BY: electronics=400, clothing=500
+      checkSparkAnswerAndOperator("""SELECT category, SUM(amount) FILTER (WHERE is_vip = true)
+        |FROM t_filter_agg_2289
+        |GROUP BY category
+        |ORDER BY category""".stripMargin)
+
+      // A group with no matching rows keeps the aggregate's empty-input state.
+      checkSparkAnswerAndOperator("""SELECT category,
+        |  SUM(amount) FILTER (WHERE amount > 450) AS high_amount,
+        |  SUM(amount) FILTER (WHERE amount < 150) AS low_amount
+        |FROM t_filter_agg_2289
+        |GROUP BY category
+        |ORDER BY category""".stripMargin)
+
+      // Multiple aggregates with different FILTER predicates
+      checkSparkAnswerAndOperator("""SELECT
+        |  SUM(amount) FILTER (WHERE is_vip = true)  AS sum_vip,
+        |  SUM(amount) FILTER (WHERE is_vip = false) AS sum_non_vip,
+        |  AVG(price) FILTER (WHERE quantity > 2)     AS avg_price,
+        |  COUNT(*) FILTER (WHERE amount IS NULL)     AS cnt_null
+        |FROM t_filter_agg_2289""".stripMargin)
+
+      // MIN/MAX with FILTER
+      checkSparkAnswerAndOperator("""SELECT
+        |  MIN(amount) FILTER (WHERE is_vip = true)  AS min_vip,
+        |  MAX(amount) FILTER (WHERE is_vip = true)  AS max_vip,
+        |  MIN(price) FILTER (WHERE quantity >= 3)   AS min_price,
+        |  MAX(price) FILTER (WHERE quantity >= 3)   AS max_price
+        |FROM t_filter_agg_2289""".stripMargin)
+
+      // Mixed filtered and non-filtered aggregates
+      checkSparkAnswerAndOperator("""SELECT
+        |  SUM(amount)                         AS total,
+        |  SUM(amount) FILTER (WHERE is_vip = true) AS vip_total,
+        |  COUNT(*)                             AS cnt_all,
+        |  COUNT(*) FILTER (WHERE amount > 200)     AS cnt_high
+        |FROM t_filter_agg_2289""".stripMargin)
+
+      // FILTER that matches all rows (equivalent to no filter)
+      checkSparkAnswerAndOperator(
+        "SELECT SUM(amount) FILTER (WHERE 1 = 1) FROM t_filter_agg_2289")
+
+      // FILTER that matches no rows (should return NULL for SUM)
+      checkSparkAnswerAndOperator(
+        "SELECT SUM(amount) FILTER (WHERE 1 = 0) FROM t_filter_agg_2289")
+
+      // COUNT(expr) with FILTER (counts only non-null expr among matching rows)
+      checkSparkAnswerAndOperator("""SELECT
+        |  COUNT(amount) FILTER (WHERE is_vip = true)    AS cnt_vip_amount,
+        |  COUNT(*) FILTER (WHERE is_vip = true)          AS cnt_vip_star,
+        |  COUNT(quantity) FILTER (WHERE amount > 150)    AS cnt_qty
+        |FROM t_filter_agg_2289""".stripMargin)
+    }
+  }
+
+  test("aggregate filter excludes null predicates") {
+    withTable("t_filter_agg_null") {
+      sql("""CREATE TABLE t_filter_agg_null(category STRING, amount INT, flag BOOLEAN)
+        |USING parquet""".stripMargin)
+      sql("""INSERT INTO t_filter_agg_null VALUES
+        |('a', 10, true), ('a', 100, NULL), ('a', 1, false), ('b', 200, NULL)
+        |""".stripMargin)
+
+      checkAnswer(
+        checkSparkAnswerAndOperator("""SELECT
+          |SUM(amount) FILTER (WHERE NOT flag), COUNT(*) FILTER (WHERE NOT flag)
+          |FROM t_filter_agg_null""".stripMargin),
+        Seq(Row(1L, 1L)))
+
+      checkAnswer(
+        checkSparkAnswerAndOperator("""SELECT category,
+          |SUM(amount) FILTER (WHERE NOT flag), COUNT(*) FILTER (WHERE NOT flag)
+          |FROM t_filter_agg_null GROUP BY category""".stripMargin),
+        Seq(Row("a", 1L, 1L), Row("b", null, 0L)))
+    }
+  }
+
+  test("test OR pushdown with an unconvertible disjunct for orc table") {
+    withTable("orc_or") {
+      sql("create table orc_or(id int, b string) using orc")
+      // enough rows so `id` statistics differ across row groups and pruning kicks in
+      sql("insert into orc_or select cast(id as int), cast(id as string) from range(0, 1000000)")
+      // `b = 900000` (string col vs int literal) -> cast(b as double)=2.0 -> not convertible
+      // `id = 5`                            -> convertible
+      // OR drops the b-branch -> pushes only `id = 5` -> row groups without id=5 are skipped,
+      // losing the row where b='900000'
+      checkSparkAnswerAndOperator("select * from orc_or where id = 5 or b = 900000")
+    }
+  }
+}

@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one or more
+  ~ contributor license agreements.  See the NOTICE file distributed with
+  ~ this work for additional information regarding copyright ownership.
+  ~ The ASF licenses this file to You under the Apache License, Version 2.0
+  ~ (the "License"); you may not use this file except in compliance with
+  ~ the License.  You may obtain a copy of the License at
+  ~
+  ~    http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing, software
+  ~ distributed under the License is distributed on an "AS IS" BASIS,
+  ~ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  ~ See the License for the specific language governing permissions and
+  ~ limitations under the License.
+  -->
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>org.apache.auron</groupId>
+    <artifactId>auron-flink-extension</artifactId>
+    <version>${project.version}</version>
+  </parent>
+
+  <artifactId>auron-flink-assembly</artifactId>
+  <name>Apache Auron Flink Assembly ${flink.version}</name>
+  <description>Apache Auron Flink Project</description>
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.auron</groupId>
+      <artifactId>auron-flink-runtime</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.auron</groupId>
+      <artifactId>auron-flink-planner</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+
+    <!-- Test dependencies -->
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter-api</artifactId>
+      <version>${junit.jupiter.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>${maven.plugin.shade.version}</version>
+        <configuration>
+          <artifactSet>
+            <excludes>
+              <exclude>org.apache.hadoop:*</exclude>
+              <exclude>org.slf4j:slf4j-api</exclude>
+              <exclude>org.slf4j:slf4j-log4j12</exclude>
+              <exclude>org.slf4j:slf4j-simple</exclude>
+              <exclude>org.slf4j:slf4j-jdk14</exclude>
+              <exclude>org.apache.flink:flink-cep</exclude>
+            </excludes>
+          </artifactSet>
+          <!-- put your configurations here -->
+          <transformers>
+            <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer">
+              <resource>META-INF/services/org.apache.flink.table.factories.TableFactory</resource>
+            </transformer>
+            <transformer implementation="org.apache.maven.plugins.shade.resource.ApacheNoticeResourceTransformer">
+              <projectName>Apache Auron</projectName>
+              <organizationName>The Apache Software Foundation</organizationName>
+              <organizationURL>https://www.apache.org/</organizationURL>
+              <inceptionYear>2025</inceptionYear>
+            </transformer>
+            <transformer implementation="org.apache.maven.plugins.shade.resource.ApacheLicenseResourceTransformer" />
+          </transformers>
+          <filters>
+            <filter>
+              <artifact>*:*</artifact>
+              <excludes>
+                <exclude>META-INF/*.SF</exclude>
+                <exclude>META-INF/*.DSA</exclude>
+                <exclude>META-INF/*.RSA</exclude>
+                <!-- Drop dependency-supplied jar-root NOTICE files. The notice transformer
+                     aggregates each dependency's META-INF/NOTICE into the final NOTICE, but it
+                     never reads a dependency's jar-root NOTICE (e.g. kafka-clients), so that
+                     required attribution is folded into this module's META-INF/NOTICE by hand
+                     instead. Excluding the jar-root copies keeps them from shipping verbatim. -->
+                <exclude>NOTICE</exclude>
+                <exclude>NOTICE.txt</exclude>
+                <exclude>NOTICE.md</exclude>
+              </excludes>
+            </filter>
+            <!-- kafka-clients and icu4j each ship a jar-root LICENSE; drop those copies so
+                 this module's jar-root LICENSE is the only top-level LICENSE in the uber jar. -->
+            <filter>
+              <artifact>org.apache.kafka:kafka-clients</artifact>
+              <excludes>
+                <exclude>LICENSE</exclude>
+              </excludes>
+            </filter>
+            <filter>
+              <artifact>com.ibm.icu:icu4j</artifact>
+              <excludes>
+                <exclude>LICENSE</exclude>
+              </excludes>
+            </filter>
+            <!-- Drop Flink's stock StreamExecCalc so only Auron's override remains in the jar.
+                 Every Auron ExecNode override needs its own <exclude> here; otherwise the stock
+                 Flink copy wins the shade. AssemblyJarStructureIT, driven by the override registry
+                 META-INF/auron/shadowed-flink-execnodes.txt, fails the build if an exclude is
+                 missing. -->
+            <filter>
+              <artifact>org.apache.flink:flink-table-planner_2.12</artifact>
+              <excludes>
+                <exclude>org/apache/flink/table/planner/plan/nodes/exec/stream/StreamExecCalc.class</exclude>
+                <exclude>org/apache/flink/table/planner/delegation/DefaultPlannerFactory.class</exclude>
+              </excludes>
+            </filter>
+          </filters>
+        </configuration>
+        <executions>
+          <execution>
+            <goals>
+              <goal>shade</goal>
+            </goals>
+            <phase>package</phase>
+          </execution>
+        </executions>
+      </plugin>
+      <!-- Run AssemblyJarStructureIT in the verify phase, after the shade has produced the
+           uber jar in the package phase, so the test inspects the actual built artifact. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-failsafe-plugin</artifactId>
+        <version>${maven.plugin.surefire.version}</version>
+        <executions>
+          <execution>
+            <goals>
+              <goal>integration-test</goal>
+              <goal>verify</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+
+</project>
